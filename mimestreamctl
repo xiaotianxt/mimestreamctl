@@ -10,8 +10,10 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-from urllib.parse import quote, urlencode
+from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 
 APP_NAME = "Mimestream"
@@ -393,7 +395,8 @@ def ensure_ax_reader_binary() -> Path:
     return binary_path
 
 
-def read_current_message_ax(*, full: bool = False, include_body: bool = True) -> dict[str, str | None]:
+def read_current_message_ax(*, full: bool = False, include_body: bool = True) -> dict[str, Any]:
+    activate_mimestream(delay_seconds=0.05)
     binary_path = ensure_ax_reader_binary()
     argv = [str(binary_path), "--json"]
     if full:
@@ -410,6 +413,116 @@ def read_current_message_ax(*, full: bool = False, include_body: bool = True) ->
     if not isinstance(payload, dict):
         raise CliError("Unexpected AX helper output.")
     return {key: value for key, value in payload.items() if value is not None}
+
+
+def read_current_message_ax_with_retry(
+    *,
+    selection_url: str | None,
+    full: bool = False,
+    include_body: bool = True,
+) -> dict[str, Any]:
+    try:
+        return read_current_message_ax(full=full, include_body=include_body)
+    except CliError as exc:
+        if "Could not find the focused Mimestream window." not in str(exc):
+            raise
+        message_links = derive_message_links(selection_url)
+        open_url = message_links.get("mimestream_open_url")
+        if not open_url:
+            raise
+        run_open(open_url)
+        time.sleep(0.35)
+        return read_current_message_ax(full=full, include_body=include_body)
+
+
+def normalize_body_links(raw_links: object) -> list[dict[str, str]]:
+    if not isinstance(raw_links, list):
+        return []
+    deduped_by_url: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    for item in raw_links:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        text = item.get("text")
+        if not isinstance(url, str) or not url:
+            continue
+        normalized: dict[str, str] = {"url": url}
+        if isinstance(text, str) and text.strip():
+            normalized["text"] = text.strip()
+        existing = deduped_by_url.get(url)
+        if existing is None:
+            deduped_by_url[url] = normalized
+            order.append(url)
+            continue
+        if len(normalized.get("text", "")) > len(existing.get("text", "")):
+            deduped_by_url[url] = normalized
+    return [deduped_by_url[url] for url in order]
+
+
+def prefer_resolved_link_text(existing: dict[str, str], candidate: dict[str, str]) -> dict[str, str]:
+    existing_text = existing.get("text", "")
+    candidate_text = candidate.get("text", "")
+    if len(candidate_text) > len(existing_text):
+        return candidate
+    return existing
+
+
+def dedupe_links_by_effective_url(links: list[dict[str, str]]) -> list[dict[str, str]]:
+    deduped: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    for link in links:
+        effective_url = link.get("resolved_url") or link.get("url")
+        if not effective_url:
+            continue
+        if effective_url not in deduped:
+            deduped[effective_url] = link
+            order.append(effective_url)
+            continue
+        deduped[effective_url] = prefer_resolved_link_text(deduped[effective_url], link)
+    return [deduped[url] for url in order]
+
+
+def is_resolvable_http_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def resolve_redirect_url(url: str, *, timeout_seconds: float = 10.0) -> str | None:
+    if not is_resolvable_http_url(url):
+        return None
+    headers = {"User-Agent": "mimestreamctl/1.0"}
+    requests = [
+        Request(url, method="HEAD", headers=headers),
+        Request(url, headers=headers),
+    ]
+    last_error: Exception | None = None
+    for request in requests:
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                return response.geturl()
+        except HTTPError as exc:
+            if exc.code in {405, 501} and request.get_method() == "HEAD":
+                last_error = exc
+                continue
+            return exc.geturl() or url
+        except URLError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        return None
+    return None
+
+
+def resolve_body_links(body_links: list[dict[str, str]]) -> list[dict[str, str]]:
+    resolved_links: list[dict[str, str]] = []
+    for link in body_links:
+        updated = dict(link)
+        resolved_url = resolve_redirect_url(link["url"])
+        if resolved_url and resolved_url != link["url"]:
+            updated["resolved_url"] = resolved_url
+        resolved_links.append(updated)
+    return dedupe_links_by_effective_url(resolved_links)
 
 
 def type_text_in_mimestream(text: str, *, delay_seconds: float = 0.15) -> None:
@@ -683,7 +796,15 @@ def render_markdown_link(label: str, url: str) -> str:
     return f"- {label}: [{url}]({url})"
 
 
-def render_read_markdown(metadata: dict[str, str | None]) -> None:
+def render_body_link_markdown(link: dict[str, str]) -> str:
+    label = link.get("text") or link["url"]
+    resolved_url = link.get("resolved_url")
+    if resolved_url and resolved_url != link["url"]:
+        return f"- {label}: [{resolved_url}]({resolved_url}) (tracked via [{link['url']}]({link['url']}))"
+    return f"- {label}: [{link['url']}]({link['url']})"
+
+
+def render_read_markdown(metadata: dict[str, Any]) -> None:
     subject = metadata.get("subject") or metadata.get("title") or "(No subject)"
     print(f"# {subject}")
     print()
@@ -712,6 +833,14 @@ def render_read_markdown(metadata: dict[str, str | None]) -> None:
         for label, url in visible_links:
             print(render_markdown_link(label, url))
 
+    body_links = metadata.get("body_links") or []
+    if body_links:
+        print()
+        print("## Body Links")
+        print()
+        for link in body_links:
+            print(render_body_link_markdown(link))
+
     body = metadata.get("body")
     if body:
         print()
@@ -720,7 +849,7 @@ def render_read_markdown(metadata: dict[str, str | None]) -> None:
         print(body)
 
 
-def render_read_plain(metadata: dict[str, str | None]) -> None:
+def render_read_plain(metadata: dict[str, Any]) -> None:
     subject = metadata.get("subject") or metadata.get("title") or "(No subject)"
     print(f"subject: {subject}")
     fields = [
@@ -735,12 +864,22 @@ def render_read_plain(metadata: dict[str, str | None]) -> None:
     for key, value in fields:
         if value:
             print(f"{key}: {value}")
+    body_links = metadata.get("body_links") or []
+    if body_links:
+        print()
+        print("body_links:")
+        for link in body_links:
+            resolved_url = link.get("resolved_url")
+            if resolved_url and resolved_url != link["url"]:
+                print(f"- {link.get('text') or link['url']}: {resolved_url} (tracked via {link['url']})")
+            else:
+                print(f"- {link.get('text') or link['url']}: {link['url']}")
     if metadata.get("body"):
         print()
         print(metadata["body"])
 
 
-def render_links_markdown(subject: str | None, links: dict[str, str]) -> None:
+def render_links_markdown(subject: str | None, links: dict[str, Any]) -> None:
     print(f"# {subject or 'Current Message Links'}")
     print()
     for label, key in [
@@ -750,12 +889,29 @@ def render_links_markdown(subject: str | None, links: dict[str, str]) -> None:
     ]:
         if links.get(key):
             print(render_markdown_link(label, links[key]))
+    body_links = links.get("body_links") or []
+    if body_links:
+        print()
+        print("## Body Links")
+        print()
+        for link in body_links:
+            print(render_body_link_markdown(link))
 
 
-def render_links_plain(links: dict[str, str]) -> None:
+def render_links_plain(links: dict[str, Any]) -> None:
     for key in ["private_link", "mimestream_open_url", "gmail_url"]:
         if links.get(key):
             print(f"{key}: {links[key]}")
+    body_links = links.get("body_links") or []
+    if body_links:
+        print()
+        print("body_links:")
+        for link in body_links:
+            resolved_url = link.get("resolved_url")
+            if resolved_url and resolved_url != link["url"]:
+                print(f"- {link.get('text') or link['url']}: {resolved_url} (tracked via {link['url']})")
+            else:
+                print(f"- {link.get('text') or link['url']}: {link['url']}")
 
 
 def cmd_selection(args: argparse.Namespace) -> None:
@@ -774,7 +930,18 @@ def cmd_read(args: argparse.Namespace) -> None:
     selection = current_selection()
     selection_item = selection[0] if selection else None
     selection_title, selection_url = parse_markdown_link(selection_item) if selection_item else (None, None)
-    metadata = read_current_message_ax(full=args.full, include_body=not args.no_body)
+    metadata = read_current_message_ax_with_retry(
+        selection_url=selection_url,
+        full=args.full,
+        include_body=not args.no_body,
+    )
+    body_links = normalize_body_links(metadata.get("body_links"))
+    if args.resolve_redirects and body_links:
+        body_links = resolve_body_links(body_links)
+    if body_links:
+        metadata["body_links"] = body_links
+    else:
+        metadata.pop("body_links", None)
     metadata["title"] = selection_title
     if selection_title:
         metadata["subject"] = selection_title
@@ -796,7 +963,13 @@ def cmd_links(args: argparse.Namespace) -> None:
     selection = current_selection()
     selection_item = selection[0] if selection else None
     selection_title, selection_url = parse_markdown_link(selection_item) if selection_item else (None, None)
-    links = derive_message_links(selection_url)
+    links: dict[str, Any] = derive_message_links(selection_url)
+    ax_metadata = read_current_message_ax_with_retry(selection_url=selection_url, include_body=False)
+    body_links = normalize_body_links(ax_metadata.get("body_links"))
+    if args.resolve_redirects and body_links:
+        body_links = resolve_body_links(body_links)
+    if body_links:
+        links["body_links"] = body_links
     if output_format == "json":
         print_json({"title": selection_title, **links})
         return
@@ -972,12 +1145,14 @@ def build_parser() -> argparse.ArgumentParser:
     mode_group.add_argument("--full", action="store_true", help="Include extra row metadata such as sender, date, and preview.")
     mode_group.add_argument("--fast", action="store_true", help=argparse.SUPPRESS)
     read_parser.add_argument("--no-body", action="store_true", help="Skip copying the visible message body.")
+    read_parser.add_argument("--resolve-redirects", action="store_true", help="Follow HTTP redirects for body links and include resolved_url when available.")
     read_parser.add_argument("--max-chars", type=int, help="Truncate the copied body to this many characters.")
     read_parser.set_defaults(func=cmd_read)
 
     links_parser = subparsers.add_parser("links", help="Show known URLs for the current message selection.")
     links_parser.add_argument("--format", choices=["markdown", "plain", "json"], default="markdown", help="Output format. Defaults to markdown.")
     links_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    links_parser.add_argument("--resolve-redirects", action="store_true", help="Follow HTTP redirects for body links and include resolved_url when available.")
     links_parser.set_defaults(func=cmd_links)
 
     activate_parser = subparsers.add_parser("activate", help="Bring Mimestream to the foreground.")

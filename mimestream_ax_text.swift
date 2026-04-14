@@ -10,6 +10,11 @@ struct Options {
     var includeBody = true
 }
 
+struct BodyLink: Codable {
+    var text: String
+    var url: String
+}
+
 struct ReadPayload: Codable {
     var window: String?
     var body: String?
@@ -17,6 +22,17 @@ struct ReadPayload: Codable {
     var date: String?
     var subject: String?
     var preview: String?
+    var bodyLinks: [BodyLink]?
+
+    enum CodingKeys: String, CodingKey {
+        case window
+        case body
+        case sender
+        case date
+        case subject
+        case preview
+        case bodyLinks = "body_links"
+    }
 }
 
 private func fail(_ message: String, code: Int32 = 1) -> Never {
@@ -76,6 +92,10 @@ private func copyElementArrayAttribute(_ element: AXUIElement, _ name: String) -
     copyAttribute(element, name) as? [AXUIElement] ?? []
 }
 
+private func parent(of element: AXUIElement) -> AXUIElement? {
+    copyElementAttribute(element, kAXParentAttribute as String)
+}
+
 private func role(of element: AXUIElement) -> String? {
     copyAttribute(element, kAXRoleAttribute as String) as? String
 }
@@ -86,6 +106,22 @@ private func boolAttribute(_ element: AXUIElement, _ name: String) -> Bool? {
 
 private func stringAttribute(_ element: AXUIElement, _ name: String) -> String? {
     copyAttribute(element, name) as? String
+}
+
+private func urlStringAttribute(_ element: AXUIElement, _ name: String) -> String? {
+    if let url = copyAttribute(element, name) as? URL {
+        return url.absoluteString
+    }
+    if let url = copyAttribute(element, name) as? NSURL {
+        return url.absoluteString
+    }
+    if let value = stringAttribute(element, name) {
+        let normalized = normalizedString(value)
+        if !normalized.isEmpty {
+            return normalized
+        }
+    }
+    return nil
 }
 
 private func normalizedString(_ value: String) -> String {
@@ -195,6 +231,54 @@ private func dedupeConsecutive(_ values: [String]) -> [String] {
     return output
 }
 
+private func dedupeBodyLinks(_ links: [BodyLink]) -> [BodyLink] {
+    var output: [BodyLink] = []
+    var seen: Set<String> = []
+    for link in links {
+        let key = "\(link.text)\u{0000}\(link.url)"
+        if seen.contains(key) {
+            continue
+        }
+        seen.insert(key)
+        output.append(link)
+    }
+    return output
+}
+
+private func linkText(for element: AXUIElement) -> String? {
+    if let value = readableString(of: element) {
+        return value
+    }
+    let descendantTexts = dedupeConsecutive(
+        collectReadableStrings(from: element, maxDepth: 12, includeRoot: false)
+    )
+    let normalized = descendantTexts.joined(separator: " ")
+    if normalized.isEmpty {
+        return nil
+    }
+    return normalized
+}
+
+private func collectBodyLinks(from root: AXUIElement, depth: Int = 0, maxDepth: Int = 32) -> [BodyLink] {
+    guard depth <= maxDepth else {
+        return []
+    }
+    var results: [BodyLink] = []
+    if role(of: root) == "AXLink" {
+        let text = linkText(for: root)
+        let url =
+            urlStringAttribute(root, "AXURL")
+            ?? urlStringAttribute(root, kAXURLAttribute as String)
+        if let text, let url, !text.isEmpty, !url.isEmpty {
+            results.append(BodyLink(text: text, url: url))
+        }
+    }
+    for child in children(of: root) {
+        results.append(contentsOf: collectBodyLinks(from: child, depth: depth + 1, maxDepth: maxDepth))
+    }
+    return results
+}
+
 private func stringForTextRange(from element: AXUIElement) -> String? {
     let parameterizedNames = Set(copyParameterizedNames(element))
     guard
@@ -232,8 +316,25 @@ private func stringForTextRange(from element: AXUIElement) -> String? {
 }
 
 private func findFocusedWindow(for app: AXUIElement) -> AXUIElement? {
-    copyElementAttribute(app, kAXFocusedWindowAttribute as String)
-        ?? copyElementArrayAttribute(app, kAXWindowsAttribute as String).first
+    if let focusedWindow = copyElementAttribute(app, kAXFocusedWindowAttribute as String) {
+        return focusedWindow
+    }
+    if let mainWindow = copyElementAttribute(app, kAXMainWindowAttribute as String) {
+        return mainWindow
+    }
+    if let focusedElement = copyElementAttribute(app, kAXFocusedUIElementAttribute as String) {
+        var current: AXUIElement? = focusedElement
+        for _ in 0..<24 {
+            guard let element = current else {
+                break
+            }
+            if role(of: element) == kAXWindowRole as String {
+                return element
+            }
+            current = parent(of: element)
+        }
+    }
+    return copyElementArrayAttribute(app, kAXWindowsAttribute as String).first
 }
 
 private func findMessageWebArea(in focusedWindow: AXUIElement) -> AXUIElement? {
@@ -277,6 +378,31 @@ private func extractBody(from focusedWindow: AXUIElement) -> String? {
     }
 
     return nil
+}
+
+private func extractBodyLinks(from focusedWindow: AXUIElement) -> [BodyLink] {
+    guard let webArea = findMessageWebArea(in: focusedWindow) else {
+        return []
+    }
+
+    let bodyCarrier =
+        children(of: webArea).first { findFirst($0, role: "AXScrollArea", maxDepth: 6) != nil }
+        ?? webArea
+
+    let bodyRoot =
+        findFirst(bodyCarrier, role: "AXScrollArea", maxDepth: 6)
+        .flatMap { children(of: $0).first }
+        ?? bodyCarrier
+
+    let roots = [bodyRoot, bodyCarrier, webArea]
+    var links: [BodyLink] = []
+    for root in roots {
+        links.append(contentsOf: collectBodyLinks(from: root))
+        if !links.isEmpty {
+            break
+        }
+    }
+    return dedupeBodyLinks(links)
 }
 
 private func findMessageTable(in focusedWindow: AXUIElement) -> AXUIElement? {
@@ -353,13 +479,15 @@ if options.includeBody && body == nil {
 
 let metadata: (sender: String?, date: String?, subject: String?, preview: String?) =
     options.includeFullMetadata ? selectedRowMetadata(in: focusedWindow) : (nil, nil, nil, nil)
+let bodyLinks = extractBodyLinks(from: focusedWindow)
 let payload = ReadPayload(
     window: windowTitle,
     body: body,
     sender: metadata.sender,
     date: metadata.date,
     subject: metadata.subject,
-    preview: metadata.preview
+    preview: metadata.preview,
+    bodyLinks: bodyLinks.isEmpty ? nil : bodyLinks
 )
 
 if options.emitJSON {

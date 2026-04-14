@@ -73,6 +73,7 @@ Read the currently selected message:
 ./mimestreamctl read --json
 ./mimestreamctl read --full --json
 ./mimestreamctl links
+./mimestreamctl links --resolve-redirects --json
 ```
 
 Reply to the selected message:
@@ -135,6 +136,8 @@ Draft a new message:
 - `read` defaults to `markdown`
 - `read` now defaults to the fast AX path
 - use `--full` to include `sender`, `date`, and `preview`
+- `read` and `links` now expose `body_links` for links found inside the message body
+- use `--resolve-redirects` to follow tracking URLs and surface a `resolved_url` when available
 - use `--format plain` for a simpler text view
 - use `--json` for structured output
 - use `links` when only URLs are needed
