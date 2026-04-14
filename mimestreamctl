@@ -393,15 +393,23 @@ def ensure_ax_reader_binary() -> Path:
     return binary_path
 
 
-def copy_current_message_body() -> str:
+def read_current_message_ax(*, full: bool = False, include_body: bool = True) -> dict[str, str | None]:
     binary_path = ensure_ax_reader_binary()
-    proc = run_process([str(binary_path)])
+    argv = [str(binary_path), "--json"]
+    if full:
+        argv.append("--full")
+    if not include_body:
+        argv.append("--no-body")
+    proc = run_process(argv)
     if proc.returncode != 0:
         raise CliError(normalize_error(proc.stderr or proc.stdout))
-    copied_text = proc.stdout.strip()
-    if not copied_text:
-        raise CliError("Could not extract the current message body.")
-    return copied_text
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"Could not decode AX helper output: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CliError("Unexpected AX helper output.")
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def type_text_in_mimestream(text: str, *, delay_seconds: float = 0.15) -> None:
@@ -766,18 +774,13 @@ def cmd_read(args: argparse.Namespace) -> None:
     selection = current_selection()
     selection_item = selection[0] if selection else None
     selection_title, selection_url = parse_markdown_link(selection_item) if selection_item else (None, None)
-    metadata = {} if args.fast else selected_row_metadata()
+    metadata = read_current_message_ax(full=args.full, include_body=not args.no_body)
     metadata["title"] = selection_title
     if selection_title:
         metadata["subject"] = selection_title
-    metadata["window"] = front_window_title()
     metadata.update(derive_message_links(selection_url))
-
-    if not args.no_body:
-        body = copy_current_message_body()
-        if args.max_chars is not None:
-            body = body[: args.max_chars]
-        metadata["body"] = body
+    if args.max_chars is not None and metadata.get("body") is not None:
+        metadata["body"] = metadata["body"][: args.max_chars]
 
     if output_format == "json":
         print_json(metadata)
@@ -965,7 +968,9 @@ def build_parser() -> argparse.ArgumentParser:
     read_parser = subparsers.add_parser("read", help="Read metadata and body text for the current message.")
     read_parser.add_argument("--format", choices=["markdown", "plain", "json"], default="markdown", help="Output format. Defaults to markdown.")
     read_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
-    read_parser.add_argument("--fast", action="store_true", help="Skip slower row-metadata lookup and return only window/title/link/body.")
+    mode_group = read_parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--full", action="store_true", help="Include extra row metadata such as sender, date, and preview.")
+    mode_group.add_argument("--fast", action="store_true", help=argparse.SUPPRESS)
     read_parser.add_argument("--no-body", action="store_true", help="Skip copying the visible message body.")
     read_parser.add_argument("--max-chars", type=int, help="Truncate the copied body to this many characters.")
     read_parser.set_defaults(func=cmd_read)

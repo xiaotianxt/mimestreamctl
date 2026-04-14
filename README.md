@@ -69,8 +69,9 @@ The bundled wrapper resolves the repo-relative CLI automatically, so the symlink
 Read the currently selected message:
 
 ```bash
-./mimestreamctl read --fast
-./mimestreamctl read --fast --json
+./mimestreamctl read
+./mimestreamctl read --json
+./mimestreamctl read --full --json
 ./mimestreamctl links
 ```
 
@@ -132,6 +133,8 @@ Draft a new message:
 ## Output Modes
 
 - `read` defaults to `markdown`
+- `read` now defaults to the fast AX path
+- use `--full` to include `sender`, `date`, and `preview`
 - use `--format plain` for a simpler text view
 - use `--json` for structured output
 - use `links` when only URLs are needed
@@ -144,7 +147,8 @@ Known link fields:
 
 ## Design Notes
 
-- `read --fast` is the default day-to-day path and avoids the slower row metadata lookup
+- `read` uses the Swift Accessibility helper by default and avoids the older slow row metadata path
+- `read --full` still uses the Swift Accessibility helper, but also asks it for extra row metadata
 - body extraction reads the message `AXWebArea` directly, so it does not depend on keyboard focus being in the message body
 - destructive or sending actions require explicit `--confirm`
 - `insert-text` restores the previous clipboard contents by default

@@ -4,9 +4,41 @@ import Foundation
 
 private let bundleID = "com.mimestream.Mimestream"
 
+struct Options {
+    var emitJSON = false
+    var includeFullMetadata = false
+    var includeBody = true
+}
+
+struct ReadPayload: Codable {
+    var window: String?
+    var body: String?
+    var sender: String?
+    var date: String?
+    var subject: String?
+    var preview: String?
+}
+
 private func fail(_ message: String, code: Int32 = 1) -> Never {
     fputs(message + "\n", stderr)
     exit(code)
+}
+
+private func parseOptions() -> Options {
+    var options = Options()
+    for argument in CommandLine.arguments.dropFirst() {
+        switch argument {
+        case "--json":
+            options.emitJSON = true
+        case "--full":
+            options.includeFullMetadata = true
+        case "--no-body":
+            options.includeBody = false
+        default:
+            fail("Unknown argument: \(argument)")
+        }
+    }
+    return options
 }
 
 private func copyAttribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
@@ -48,6 +80,38 @@ private func role(of element: AXUIElement) -> String? {
     copyAttribute(element, kAXRoleAttribute as String) as? String
 }
 
+private func boolAttribute(_ element: AXUIElement, _ name: String) -> Bool? {
+    copyAttribute(element, name) as? Bool
+}
+
+private func stringAttribute(_ element: AXUIElement, _ name: String) -> String? {
+    copyAttribute(element, name) as? String
+}
+
+private func normalizedString(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\u{00A0}", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func readableString(of element: AXUIElement) -> String? {
+    let candidates = [
+        kAXTitleAttribute as String,
+        kAXValueAttribute as String,
+        kAXDescriptionAttribute as String,
+        kAXHelpAttribute as String,
+    ]
+    for name in candidates {
+        if let value = stringAttribute(element, name) {
+            let normalized = normalizedString(value)
+            if !normalized.isEmpty {
+                return normalized
+            }
+        }
+    }
+    return nil
+}
+
 private func children(of element: AXUIElement) -> [AXUIElement] {
     copyElementArrayAttribute(element, kAXChildrenAttribute as String)
 }
@@ -70,37 +134,53 @@ private func lastChild(of element: AXUIElement, role wanted: String) -> AXUIElem
     return nil
 }
 
-private func findFirst(_ root: AXUIElement, role wanted: String, depth: Int = 0) -> AXUIElement? {
+private func findFirst(_ root: AXUIElement, role wanted: String, depth: Int = 0, maxDepth: Int = 10) -> AXUIElement? {
     if role(of: root) == wanted {
         return root
     }
-    guard depth < 8 else {
+    guard depth < maxDepth else {
         return nil
     }
     for child in children(of: root) {
-        if let found = findFirst(child, role: wanted, depth: depth + 1) {
+        if let found = findFirst(child, role: wanted, depth: depth + 1, maxDepth: maxDepth) {
             return found
         }
     }
     return nil
 }
 
-private func collectStaticTexts(from root: AXUIElement, depth: Int = 0) -> [String] {
-    guard depth < 24 else {
+private func collectReadableStrings(
+    from root: AXUIElement,
+    depth: Int = 0,
+    maxDepth: Int = 32,
+    includeRoot: Bool = true
+) -> [String] {
+    guard depth <= maxDepth else {
         return []
     }
     var results: [String] = []
-    if role(of: root) == "AXStaticText",
-       let value = copyAttribute(root, kAXValueAttribute as String) as? String ?? copyAttribute(root, kAXTitleAttribute as String) as? String {
-        let normalized = value
-            .replacingOccurrences(of: "\u{00A0}", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !normalized.isEmpty {
-            results.append(normalized)
-        }
+    if includeRoot,
+       let elementRole = role(of: root),
+       ["AXStaticText", "AXLink", "AXButton", "AXHeading"].contains(elementRole),
+       let value = readableString(of: root) {
+        results.append(value)
     }
     for child in children(of: root) {
-        results.append(contentsOf: collectStaticTexts(from: child, depth: depth + 1))
+        results.append(contentsOf: collectReadableStrings(from: child, depth: depth + 1, maxDepth: maxDepth))
+    }
+    return results
+}
+
+private func collectRowParts(from root: AXUIElement, depth: Int = 0, maxDepth: Int = 2) -> [String] {
+    guard depth <= maxDepth else {
+        return []
+    }
+    var results: [String] = []
+    for child in children(of: root) {
+        if let value = readableString(of: child) {
+            results.append(value)
+        }
+        results.append(contentsOf: collectRowParts(from: child, depth: depth + 1, maxDepth: maxDepth))
     }
     return results
 }
@@ -115,75 +195,186 @@ private func dedupeConsecutive(_ values: [String]) -> [String] {
     return output
 }
 
-guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
-    fail("Mimestream is not running.")
+private func stringForTextRange(from element: AXUIElement) -> String? {
+    let parameterizedNames = Set(copyParameterizedNames(element))
+    guard
+        let start = copyAttribute(element, "AXStartTextMarker"),
+        let end = copyAttribute(element, "AXEndTextMarker")
+    else {
+        return nil
+    }
+
+    let markers: [AnyObject] = [start, end]
+    let rangeValue =
+        copyParameterizedValue(element, "AXTextMarkerRangeForUnorderedTextMarkers", parameter: markers as AnyObject)
+        ?? copyParameterizedValue(element, "AXTextMarkerRangeForTextMarkers", parameter: markers as AnyObject)
+    guard let rangeValue else {
+        return nil
+    }
+
+    if parameterizedNames.contains("AXStringForTextMarkerRange"),
+       let stringValue = copyParameterizedValue(element, "AXStringForTextMarkerRange", parameter: rangeValue) as? String {
+        let normalized = normalizedString(stringValue)
+        if !normalized.isEmpty {
+            return normalized
+        }
+    }
+
+    if parameterizedNames.contains("AXAttributedStringForTextMarkerRange"),
+       let attrValue = copyParameterizedValue(element, "AXAttributedStringForTextMarkerRange", parameter: rangeValue) as? NSAttributedString {
+        let normalized = normalizedString(attrValue.string)
+        if !normalized.isEmpty {
+            return normalized
+        }
+    }
+
+    return nil
 }
 
-let axApp = AXUIElementCreateApplication(app.processIdentifier)
-let focusedWindow =
-    copyElementAttribute(axApp, kAXFocusedWindowAttribute as String)
-    ?? copyElementArrayAttribute(axApp, kAXWindowsAttribute as String).first
-guard let focusedWindow else {
-    fail("Could not find the focused Mimestream window.")
+private func findFocusedWindow(for app: AXUIElement) -> AXUIElement? {
+    copyElementAttribute(app, kAXFocusedWindowAttribute as String)
+        ?? copyElementArrayAttribute(app, kAXWindowsAttribute as String).first
 }
 
-let directWebArea =
-    firstChild(of: focusedWindow, role: "AXSplitGroup")
-    .flatMap { lastChild(of: $0, role: "AXGroup") }
-    .flatMap { firstChild(of: $0, role: "AXGroup") }
-    .flatMap { firstChild(of: $0, role: "AXScrollArea") }
-    .flatMap { firstChild(of: $0, role: "AXWebArea") }
+private func findMessageWebArea(in focusedWindow: AXUIElement) -> AXUIElement? {
+    let directWebArea =
+        firstChild(of: focusedWindow, role: "AXSplitGroup")
+        .flatMap { lastChild(of: $0, role: "AXGroup") }
+        .flatMap { firstChild(of: $0, role: "AXGroup") }
+        .flatMap { firstChild(of: $0, role: "AXScrollArea") }
+        .flatMap { firstChild(of: $0, role: "AXWebArea") }
 
-guard let webArea = directWebArea ?? findFirst(focusedWindow, role: "AXWebArea") else {
-    fail("Could not find a message web area in the current window.")
+    return directWebArea ?? findFirst(focusedWindow, role: "AXWebArea", maxDepth: 12)
 }
 
-let bodyCarrier =
-    children(of: webArea).first { findFirst($0, role: "AXScrollArea") != nil }
-    ?? webArea
+private func extractBody(from focusedWindow: AXUIElement) -> String? {
+    guard let webArea = findMessageWebArea(in: focusedWindow) else {
+        return nil
+    }
 
-let bodyRoot =
-    findFirst(bodyCarrier, role: "AXScrollArea")
-    .flatMap { children(of: $0).first }
-    ?? bodyCarrier
+    let bodyCarrier =
+        children(of: webArea).first { findFirst($0, role: "AXScrollArea", maxDepth: 6) != nil }
+        ?? webArea
 
-let staticTexts = dedupeConsecutive(collectStaticTexts(from: bodyRoot))
-if !staticTexts.isEmpty {
-    print(staticTexts.joined(separator: "\n"))
-    exit(0)
+    let bodyRoot =
+        findFirst(bodyCarrier, role: "AXScrollArea", maxDepth: 6)
+        .flatMap { children(of: $0).first }
+        ?? bodyCarrier
+
+    let textRoots = [bodyRoot, bodyCarrier, webArea]
+    for root in textRoots {
+        let texts = dedupeConsecutive(collectReadableStrings(from: root))
+        if !texts.isEmpty {
+            return texts.joined(separator: "\n")
+        }
+    }
+
+    let markerRoots = [bodyRoot, bodyCarrier, webArea]
+    for root in markerRoots {
+        if let text = stringForTextRange(from: root) {
+            return text
+        }
+    }
+
+    return nil
 }
 
-let parameterizedNames = Set(copyParameterizedNames(webArea))
-guard
-    let start = copyAttribute(webArea, "AXStartTextMarker"),
-    let end = copyAttribute(webArea, "AXEndTextMarker")
-else {
-    fail("Could not read the message text markers.")
+private func findMessageTable(in focusedWindow: AXUIElement) -> AXUIElement? {
+    let splitGroup = firstChild(of: focusedWindow, role: "AXSplitGroup") ?? findFirst(focusedWindow, role: "AXSplitGroup", maxDepth: 6)
+    guard let splitGroup else {
+        return nil
+    }
+
+    for child in children(of: splitGroup) {
+        guard role(of: child) == "AXScrollArea" else {
+            continue
+        }
+        if let table = firstChild(of: child, role: "AXTable") ?? findFirst(child, role: "AXTable", maxDepth: 4) {
+            return table
+        }
+    }
+
+    return findFirst(splitGroup, role: "AXTable", maxDepth: 8)
 }
 
-let markers: [AnyObject] = [start, end]
-let rangeValue =
-    copyParameterizedValue(webArea, "AXTextMarkerRangeForUnorderedTextMarkers", parameter: markers as AnyObject)
-    ?? copyParameterizedValue(webArea, "AXTextMarkerRangeForTextMarkers", parameter: markers as AnyObject)
+private func selectedRow(in table: AXUIElement) -> AXUIElement? {
+    let rows = copyElementArrayAttribute(table, kAXRowsAttribute as String)
+    if let selected = rows.first(where: { boolAttribute($0, kAXSelectedAttribute as String) == true }) {
+        return selected
+    }
 
-guard let rangeValue else {
-    fail("Could not construct a text range for the current message.")
-}
-
-if parameterizedNames.contains("AXStringForTextMarkerRange"),
-   let stringValue = copyParameterizedValue(webArea, "AXStringForTextMarkerRange", parameter: rangeValue) as? String,
-   !stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-    print(stringValue)
-    exit(0)
-}
-
-if parameterizedNames.contains("AXAttributedStringForTextMarkerRange"),
-   let attrValue = copyParameterizedValue(webArea, "AXAttributedStringForTextMarkerRange", parameter: rangeValue) as? NSAttributedString {
-    let text = attrValue.string.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !text.isEmpty {
-        print(text)
-        exit(0)
+    return children(of: table).first {
+        role(of: $0) == "AXRow" && boolAttribute($0, kAXSelectedAttribute as String) == true
     }
 }
 
-fail("Could not extract text from the current message body.")
+private func selectedRowMetadata(in focusedWindow: AXUIElement) -> (sender: String?, date: String?, subject: String?, preview: String?) {
+    guard
+        let table = findMessageTable(in: focusedWindow),
+        let row = selectedRow(in: table)
+    else {
+        return (nil, nil, nil, nil)
+    }
+
+    let cell = firstChild(of: row, role: "AXCell") ?? children(of: row).first ?? row
+    let parts = dedupeConsecutive(collectRowParts(from: cell))
+
+    func value(at index: Int) -> String? {
+        guard index < parts.count else {
+            return nil
+        }
+        return parts[index]
+    }
+
+    return (
+        sender: value(at: 0),
+        date: value(at: 1),
+        subject: value(at: 2),
+        preview: value(at: 4)
+    )
+}
+
+let options = parseOptions()
+
+guard let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
+    fail("Mimestream is not running.")
+}
+
+let axApp = AXUIElementCreateApplication(runningApp.processIdentifier)
+guard let focusedWindow = findFocusedWindow(for: axApp) else {
+    fail("Could not find the focused Mimestream window.")
+}
+
+let windowTitle = readableString(of: focusedWindow)
+let body: String? = options.includeBody ? extractBody(from: focusedWindow) : nil
+if options.includeBody && body == nil {
+    fail("Could not extract text from the current message body.")
+}
+
+let metadata: (sender: String?, date: String?, subject: String?, preview: String?) =
+    options.includeFullMetadata ? selectedRowMetadata(in: focusedWindow) : (nil, nil, nil, nil)
+let payload = ReadPayload(
+    window: windowTitle,
+    body: body,
+    sender: metadata.sender,
+    date: metadata.date,
+    subject: metadata.subject,
+    preview: metadata.preview
+)
+
+if options.emitJSON {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    guard let data = try? encoder.encode(payload), let json = String(data: data, encoding: .utf8) else {
+        fail("Could not encode the AX payload.")
+    }
+    print(json)
+    exit(0)
+}
+
+if let body {
+    print(body)
+    exit(0)
+}
+
+fail("No output was produced.")

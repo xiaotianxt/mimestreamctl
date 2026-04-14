@@ -21,8 +21,9 @@ Use this skill for day-to-day mail actions inside the local `Mimestream` app on 
 ## Workflow
 
 - Reading the current message:
-  - Prefer `~/.codex/skills/mimestreamctl/scripts/mimestreamctl read --fast`
+  - Prefer `~/.codex/skills/mimestreamctl/scripts/mimestreamctl read`
   - Default output is Markdown.
+  - Use `--full` when sender, date, and preview are needed.
   - Use `--format plain` or `--json` when a simpler or structured format is better.
 - Getting message URLs only:
   - Use `~/.codex/skills/mimestreamctl/scripts/mimestreamctl links`
@@ -57,7 +58,8 @@ Use this skill for day-to-day mail actions inside the local `Mimestream` app on 
 
 ## Operating Rules
 
-- Prefer `read --fast` for normal reading. It is much faster than the fuller metadata path.
+- Prefer `read` for normal reading. It uses the fast Swift AX path by default.
+- Use `read --full` only when sender, date, or preview are needed.
 - Use `links` when only URLs are needed; do not read the whole body first unless the user needs it.
 - Before write actions, make sure the correct message or draft is active in `Mimestream`.
 - `send`, `send-and-archive`, `trash`, and `spam` are guarded and require `--confirm`.
