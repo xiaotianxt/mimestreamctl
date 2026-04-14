@@ -1,0 +1,861 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import quote, urlencode
+
+
+APP_NAME = "Mimestream"
+APP_BUNDLE_ID = "com.mimestream.Mimestream"
+
+
+class CliError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class MenuAction:
+    menu: str
+    item: str
+    help: str
+    requires_confirm: bool = False
+
+
+ACTIONS: dict[str, MenuAction] = {
+    "archive": MenuAction("Message", "Archive", "Archive the current selection."),
+    "mark-read": MenuAction("Message", "Mark as Read", "Mark the current selection as read."),
+    "mark-all-read": MenuAction("Message", "Mark All as Read", "Mark all messages in the current mailbox as read."),
+    "star": MenuAction("Message", "Add Star", "Star the current selection."),
+    "important": MenuAction("Message", "Mark as Important", "Mark the current selection as important."),
+    "forward": MenuAction("Message", "Forward", "Forward the current selection."),
+    "move-to-inbox": MenuAction("Message", "Move to Inbox", "Move the current selection back to Inbox."),
+    "not-spam": MenuAction("Message", "Not Spam", "Mark the current selection as not spam."),
+    "new-message": MenuAction("File", "New Message", "Open a new compose window."),
+    "trash": MenuAction("Message", "Move to Trash", "Move the current selection to Trash.", requires_confirm=True),
+    "spam": MenuAction("Message", "Report Spam", "Report the current selection as spam.", requires_confirm=True),
+    "send": MenuAction("Message", "Send", "Send the active draft.", requires_confirm=True),
+    "send-and-archive": MenuAction("Message", "Send and Archive", "Send the active draft and archive the conversation.", requires_confirm=True),
+}
+
+
+GO_DESTINATIONS = {
+    "inbox": "Inbox",
+    "starred": "Starred",
+    "sent": "Sent",
+    "all-mail": "All Mail",
+    "spam": "Spam",
+    "trash": "Trash",
+}
+
+
+MARKDOWN_LINK_RE = re.compile(r"^\[(?P<title>.*)\]\((?P<url>.*)\)$")
+MIMESTREAM_PRIVATE_LINK_RE = re.compile(r"^https://links\.mimestream\.com/g/(?P<account>[^/]+)/t/(?P<message_id>[^/?#]+)$")
+
+
+def applescript_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def run_process(argv: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def normalize_error(raw: str) -> str:
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
+        return "Command failed."
+    message = lines[-1]
+    if "execution error:" in message:
+        message = message.split("execution error:", 1)[1].strip()
+    if "Not authorized to send Apple events" in raw or "(-1743)" in raw:
+        return (
+            f"{message}\n"
+            "Grant your terminal app Automation/Accessibility access for System Events and Mimestream, then retry."
+        )
+    if "(-10827)" in raw:
+        return (
+            f"{message}\n"
+            "The GUI session is not reachable. Run this inside your logged-in macOS desktop session."
+        )
+    return message
+
+
+def run_osascript(script: str) -> str:
+    proc = run_process(["osascript", "-"], input_text=script)
+    stdout = proc.stdout.strip()
+    stderr = proc.stderr.strip()
+    if proc.returncode != 0:
+        raise CliError(normalize_error(stderr or stdout))
+    return stdout
+
+
+def run_open(url: str) -> None:
+    proc = run_process(["open", "-a", APP_NAME, url])
+    if proc.returncode != 0:
+        raise CliError(normalize_error(proc.stderr or proc.stdout))
+
+
+def top_menus() -> list[str]:
+    script = f"""
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        set menuNames to name of every menu bar item of menu bar 1
+    end tell
+end tell
+set AppleScript's text item delimiters to linefeed
+return menuNames as text
+"""
+    output = run_osascript(script)
+    return [line for line in output.splitlines() if line]
+
+
+def menu_items(menu_name: str) -> list[str]:
+    script = f"""
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        if not (exists menu bar item {applescript_string(menu_name)} of menu bar 1) then
+            error "Top-level menu not found: " & {applescript_string(menu_name)}
+        end if
+        set itemNames to {{}}
+        repeat with menuItemRef in every menu item of menu 1 of menu bar item {applescript_string(menu_name)} of menu bar 1
+            set itemName to name of menuItemRef
+            if itemName is not missing value then
+                copy itemName to end of itemNames
+            end if
+        end repeat
+    end tell
+end tell
+set AppleScript's text item delimiters to linefeed
+return itemNames as text
+"""
+    output = run_osascript(script)
+    return [line for line in output.splitlines() if line]
+
+
+def current_selection() -> list[str]:
+    script = f"""
+tell application id {applescript_string(APP_BUNDLE_ID)}
+    set sel to selection
+end tell
+if sel is missing value then
+    return ""
+end if
+if class of sel is list then
+    set AppleScript's text item delimiters to linefeed
+    return sel as text
+end if
+return sel as text
+"""
+    output = run_osascript(script)
+    return [line for line in output.splitlines() if line]
+
+
+def parse_markdown_link(value: str) -> tuple[str | None, str | None]:
+    match = MARKDOWN_LINK_RE.match(value)
+    if not match:
+        return None, None
+    return match.group("title"), match.group("url")
+
+
+def derive_message_links(selection_url: str | None) -> dict[str, str]:
+    if not selection_url:
+        return {}
+    match = MIMESTREAM_PRIVATE_LINK_RE.match(selection_url)
+    links = {"private_link": selection_url}
+    if not match:
+        return links
+    account = match.group("account")
+    message_id = match.group("message_id")
+    links["mimestream_open_url"] = f"mimestream:///open/g/{account}/t/{message_id}"
+    links["gmail_url"] = f"https://mail.google.com/mail?{urlencode({'authuser': account})}#all/{message_id}"
+    return links
+
+
+def applescript_list(values: list[str]) -> str:
+    return "{" + ", ".join(applescript_string(value) for value in values) + "}"
+
+
+def click_menu_item(menu_name: str, item_name: str, *, dry_run: bool = False) -> None:
+    if dry_run:
+        print(f"Would click {menu_name} > {item_name}")
+        return
+    script = f"""
+tell application id {applescript_string(APP_BUNDLE_ID)} to activate
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        if not (exists menu bar item {applescript_string(menu_name)} of menu bar 1) then
+            error "Top-level menu not found: " & {applescript_string(menu_name)}
+        end if
+        if not (exists menu item {applescript_string(item_name)} of menu 1 of menu bar item {applescript_string(menu_name)} of menu bar 1) then
+            error "Menu item not found: " & {applescript_string(menu_name)} & " > " & {applescript_string(item_name)}
+        end if
+        set targetItem to menu item {applescript_string(item_name)} of menu 1 of menu bar item {applescript_string(menu_name)} of menu bar 1
+        if enabled of targetItem is false then
+            error "Menu item is disabled: " & {applescript_string(menu_name)} & " > " & {applescript_string(item_name)}
+        end if
+        click targetItem
+    end tell
+end tell
+"""
+    run_osascript(script)
+
+
+def front_window_title() -> str:
+    return run_osascript(
+        f'tell application "System Events" to tell process {applescript_string(APP_NAME)} to name of front window'
+    )
+
+
+def selected_row_metadata() -> dict[str, str | None]:
+    script = """
+tell application "System Events"
+    tell process "Mimestream"
+        if not (exists front window) then
+            error "No front window."
+        end if
+        set splitGroup to missing value
+        repeat with childElement in UI elements of front window
+            if role of childElement is "AXSplitGroup" then
+                set splitGroup to childElement
+                exit repeat
+            end if
+        end repeat
+        if splitGroup is missing value then
+            error "Could not find the main split view."
+        end if
+        set scrollAreas to UI elements of splitGroup
+        set messageListArea to missing value
+        repeat with candidateArea in scrollAreas
+            if role of candidateArea is "AXScrollArea" then
+                repeat with areaChild in UI elements of candidateArea
+                    if role of areaChild is "AXTable" then
+                        set messageListArea to candidateArea
+                        exit repeat
+                    end if
+                end repeat
+                if messageListArea is not missing value then exit repeat
+            end if
+        end repeat
+        if messageListArea is missing value then
+            error "Could not find the message list."
+        end if
+        set messageTable to missing value
+        repeat with areaChild in UI elements of messageListArea
+            if role of areaChild is "AXTable" then
+                set messageTable to areaChild
+                exit repeat
+            end if
+        end repeat
+        if messageTable is missing value then
+            error "Could not find the message table."
+        end if
+        set selectedRowCount to count rows of messageTable whose selected is true
+        if selectedRowCount is 0 then
+            error "No selected message row."
+        end if
+        set selectedCell to UI element 1 of (first row of messageTable whose selected is true)
+        set parts to name of UI elements of selectedCell
+    end tell
+end tell
+set normalizedParts to {}
+repeat with partValue in parts
+    if partValue is missing value then
+        copy "" to end of normalizedParts
+    else
+        copy (partValue as text) to end of normalizedParts
+    end if
+end repeat
+set AppleScript's text item delimiters to linefeed
+return normalizedParts as text
+"""
+    lines = run_osascript(script).splitlines()
+    values = [line.strip() for line in lines]
+
+    def normalize(value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value or value == "missing value":
+            return None
+        return value
+
+    sender = normalize(values[0] if len(values) > 0 else None)
+    date_text = normalize(values[1] if len(values) > 1 else None)
+    subject = normalize(values[2] if len(values) > 2 else None)
+    preview = normalize(values[4] if len(values) > 4 else None)
+    return {
+        "sender": sender,
+        "date": date_text,
+        "subject": subject,
+        "preview": preview,
+    }
+
+
+def compose_mailto_url(
+    to: list[str],
+    cc: list[str],
+    bcc: list[str],
+    subject: str | None,
+    body: str | None,
+) -> str:
+    recipients = ",".join(to)
+    query: dict[str, str] = {}
+    if cc:
+        query["cc"] = ",".join(cc)
+    if bcc:
+        query["bcc"] = ",".join(bcc)
+    if subject is not None:
+        query["subject"] = subject
+    if body is not None:
+        query["body"] = body
+    query_string = urlencode(query, quote_via=quote)
+    base = f"mailto:{quote(recipients, safe='@,')}"
+    return f"{base}?{query_string}" if query_string else base
+
+
+def read_text_argument(text: str | None, file_path: str | None) -> str | None:
+    if text is not None and file_path is not None:
+        raise CliError("Pass either inline text or --file, not both.")
+    if file_path is not None:
+        return Path(file_path).read_text(encoding="utf-8")
+    return text
+
+
+def set_text_clipboard(text: str) -> None:
+    proc = run_process(["pbcopy"], input_text=text)
+    if proc.returncode != 0:
+        raise CliError(normalize_error(proc.stderr or proc.stdout))
+
+
+def get_text_clipboard() -> str:
+    proc = run_process(["pbpaste"])
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
+
+
+def paste_into_mimestream(*, dry_run: bool = False, delay_seconds: float = 0.15) -> None:
+    if dry_run:
+        print("Would activate Mimestream and paste clipboard contents")
+        return
+    script = f"""
+tell application id {applescript_string(APP_BUNDLE_ID)} to activate
+delay {delay_seconds}
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        keystroke "v" using command down
+    end tell
+end tell
+"""
+    run_osascript(script)
+
+
+def ax_reader_source_path() -> Path:
+    return Path(__file__).with_name("mimestream_ax_text.swift")
+
+
+def ax_reader_binary_path() -> Path:
+    return Path("/tmp/mimestreamctl-ax-text")
+
+
+def ensure_ax_reader_binary() -> Path:
+    source_path = ax_reader_source_path()
+    binary_path = ax_reader_binary_path()
+    if binary_path.exists() and binary_path.stat().st_mtime >= source_path.stat().st_mtime:
+        return binary_path
+    proc = run_process(["swiftc", str(source_path), "-O", "-o", str(binary_path)])
+    if proc.returncode != 0:
+        raise CliError(normalize_error(proc.stderr or proc.stdout))
+    return binary_path
+
+
+def copy_current_message_body() -> str:
+    binary_path = ensure_ax_reader_binary()
+    proc = run_process([str(binary_path)])
+    if proc.returncode != 0:
+        raise CliError(normalize_error(proc.stderr or proc.stdout))
+    copied_text = proc.stdout.strip()
+    if not copied_text:
+        raise CliError("Could not extract the current message body.")
+    return copied_text
+
+
+def type_text_in_mimestream(text: str, *, delay_seconds: float = 0.15) -> None:
+    script = f"""
+tell application id {applescript_string(APP_BUNDLE_ID)} to activate
+delay {delay_seconds}
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        keystroke {applescript_string(text)}
+    end tell
+end tell
+"""
+    run_osascript(script)
+
+
+def press_key_code(key_code: int, *, delay_seconds: float = 0.1) -> None:
+    script = f"""
+tell application id {applescript_string(APP_BUNDLE_ID)} to activate
+delay {delay_seconds}
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        key code {key_code}
+    end tell
+end tell
+"""
+    run_osascript(script)
+
+
+def start_reply(menu_item: str, *, dry_run: bool = False) -> None:
+    click_menu_item("Message", menu_item, dry_run=dry_run)
+
+
+def start_move(destination: str, *, dry_run: bool = False, open_delay: float = 0.15) -> None:
+    if dry_run:
+        print(f"Would open Message > Move to… and type {destination!r}")
+        return
+    click_menu_item("Message", "Move to…")
+    type_text_in_mimestream(destination, delay_seconds=open_delay)
+    press_key_code(36, delay_seconds=open_delay)
+
+
+def close_window_by_title(title: str, *, dry_run: bool = False) -> None:
+    if dry_run:
+        print(f"Would close window {title!r}")
+        return
+    script = f"""
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        if not (exists window {applescript_string(title)}) then
+            error "Window not found: " & {applescript_string(title)}
+        end if
+        perform action "AXPress" of value of attribute "AXCloseButton" of window {applescript_string(title)}
+    end tell
+end tell
+"""
+    run_osascript(script)
+
+
+def require_confirmation(args: argparse.Namespace, action: MenuAction) -> None:
+    if action.requires_confirm and not args.confirm:
+        raise CliError(f"`{args.command}` requires --confirm.")
+
+
+def print_json(data: object) -> None:
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def resolve_output_format(args: argparse.Namespace) -> str:
+    if getattr(args, "json", False):
+        if getattr(args, "format", "markdown") != "markdown":
+            raise CliError("Pass either --json or --format, not both.")
+        return "json"
+    return getattr(args, "format", "markdown")
+
+
+def render_markdown_link(label: str, url: str) -> str:
+    return f"- {label}: [{url}]({url})"
+
+
+def render_read_markdown(metadata: dict[str, str | None]) -> None:
+    subject = metadata.get("subject") or metadata.get("title") or "(No subject)"
+    print(f"# {subject}")
+    print()
+
+    fields = [
+        ("Window", metadata.get("window")),
+        ("From", metadata.get("sender")),
+        ("Date", metadata.get("date")),
+        ("Preview", metadata.get("preview")),
+    ]
+    for label, value in fields:
+        if value:
+            print(f"- {label}: {value}")
+
+    link_rows = [
+        ("Private Link", metadata.get("private_link")),
+        ("Open in Mimestream", metadata.get("mimestream_open_url")),
+        ("Open in Gmail", metadata.get("gmail_url")),
+    ]
+    visible_links = [(label, url) for label, url in link_rows if url]
+    if visible_links:
+        if any(value for _, value in fields):
+            print()
+        print("## Links")
+        print()
+        for label, url in visible_links:
+            print(render_markdown_link(label, url))
+
+    body = metadata.get("body")
+    if body:
+        print()
+        print("## Body")
+        print()
+        print(body)
+
+
+def render_read_plain(metadata: dict[str, str | None]) -> None:
+    subject = metadata.get("subject") or metadata.get("title") or "(No subject)"
+    print(f"subject: {subject}")
+    fields = [
+        ("window", metadata.get("window")),
+        ("sender", metadata.get("sender")),
+        ("date", metadata.get("date")),
+        ("preview", metadata.get("preview")),
+        ("private_link", metadata.get("private_link")),
+        ("mimestream_open_url", metadata.get("mimestream_open_url")),
+        ("gmail_url", metadata.get("gmail_url")),
+    ]
+    for key, value in fields:
+        if value:
+            print(f"{key}: {value}")
+    if metadata.get("body"):
+        print()
+        print(metadata["body"])
+
+
+def render_links_markdown(subject: str | None, links: dict[str, str]) -> None:
+    print(f"# {subject or 'Current Message Links'}")
+    print()
+    for label, key in [
+        ("Private Link", "private_link"),
+        ("Open in Mimestream", "mimestream_open_url"),
+        ("Open in Gmail", "gmail_url"),
+    ]:
+        if links.get(key):
+            print(render_markdown_link(label, links[key]))
+
+
+def render_links_plain(links: dict[str, str]) -> None:
+    for key in ["private_link", "mimestream_open_url", "gmail_url"]:
+        if links.get(key):
+            print(f"{key}: {links[key]}")
+
+
+def cmd_selection(args: argparse.Namespace) -> None:
+    selection = current_selection()
+    if args.first:
+        selection = selection[:1]
+    if args.json:
+        print_json({"selection": selection})
+        return
+    for item in selection:
+        print(item)
+
+
+def cmd_read(args: argparse.Namespace) -> None:
+    output_format = resolve_output_format(args)
+    selection = current_selection()
+    selection_item = selection[0] if selection else None
+    selection_title, selection_url = parse_markdown_link(selection_item) if selection_item else (None, None)
+    metadata = {} if args.fast else selected_row_metadata()
+    metadata["title"] = selection_title
+    if selection_title:
+        metadata["subject"] = selection_title
+    metadata["window"] = front_window_title()
+    metadata.update(derive_message_links(selection_url))
+
+    if not args.no_body:
+        body = copy_current_message_body()
+        if args.max_chars is not None:
+            body = body[: args.max_chars]
+        metadata["body"] = body
+
+    if output_format == "json":
+        print_json(metadata)
+        return
+    if output_format == "plain":
+        render_read_plain(metadata)
+        return
+    render_read_markdown(metadata)
+
+
+def cmd_links(args: argparse.Namespace) -> None:
+    output_format = resolve_output_format(args)
+    selection = current_selection()
+    selection_item = selection[0] if selection else None
+    selection_title, selection_url = parse_markdown_link(selection_item) if selection_item else (None, None)
+    links = derive_message_links(selection_url)
+    if output_format == "json":
+        print_json({"title": selection_title, **links})
+        return
+    if output_format == "plain":
+        render_links_plain(links)
+        return
+    render_links_markdown(selection_title, links)
+
+
+def cmd_activate(_: argparse.Namespace) -> None:
+    run_osascript(f'tell application id {applescript_string(APP_BUNDLE_ID)} to activate')
+
+
+def cmd_menus(args: argparse.Namespace) -> None:
+    if args.all:
+        menu_names = top_menus()
+        payload = {name: menu_items(name) for name in menu_names}
+    elif args.menu:
+        payload = {name: menu_items(name) for name in args.menu}
+    else:
+        payload = {"menus": top_menus()}
+
+    if args.json:
+        print_json(payload)
+        return
+
+    if "menus" in payload:
+        for name in payload["menus"]:
+            print(name)
+        return
+
+    first = True
+    for name, items in payload.items():
+        if not first:
+            print()
+        first = False
+        print(f"[{name}]")
+        for item in items:
+            print(item)
+
+
+def cmd_click(args: argparse.Namespace) -> None:
+    click_menu_item(args.menu, args.item, dry_run=args.dry_run)
+
+
+def run_reply_flow(
+    menu_item: str,
+    *,
+    body: str | None,
+    dry_run: bool,
+    wait_seconds: float,
+    send: bool,
+    send_and_archive: bool,
+    confirm: bool,
+    restore_clipboard: bool,
+) -> None:
+    start_reply(menu_item, dry_run=dry_run)
+    if dry_run:
+        if body is not None:
+            print("Would paste reply body into the new draft")
+        if send:
+            print("Would send the reply draft")
+        if send_and_archive:
+            print("Would send and archive the reply draft")
+        return
+    if body is not None:
+        original_clipboard = get_text_clipboard()
+        try:
+            set_text_clipboard(body)
+            paste_into_mimestream(delay_seconds=wait_seconds)
+        finally:
+            if restore_clipboard:
+                set_text_clipboard(original_clipboard)
+    if send or send_and_archive:
+        if not confirm:
+            raise CliError("Sending a reply requires --confirm.")
+        if send_and_archive:
+            click_menu_item("Message", "Send and Archive")
+        else:
+            click_menu_item("Message", "Send")
+
+
+def cmd_action(args: argparse.Namespace) -> None:
+    action = ACTIONS[args.command]
+    require_confirmation(args, action)
+    click_menu_item(action.menu, action.item, dry_run=args.dry_run)
+
+
+def cmd_go(args: argparse.Namespace) -> None:
+    destination = GO_DESTINATIONS[args.destination]
+    click_menu_item("Go", destination, dry_run=args.dry_run)
+
+
+def cmd_move(args: argparse.Namespace) -> None:
+    start_move(args.destination, dry_run=args.dry_run, open_delay=args.delay)
+
+
+def cmd_compose(args: argparse.Namespace) -> None:
+    body = read_text_argument(args.body, args.body_file)
+    url = compose_mailto_url(args.to or [], args.cc or [], args.bcc or [], args.subject, body)
+    if args.print_url or args.dry_run:
+        print(url)
+        if args.dry_run:
+            return
+    run_open(url)
+
+
+def cmd_reply(args: argparse.Namespace) -> None:
+    body = read_text_argument(args.body, args.body_file)
+    run_reply_flow(
+        "Reply",
+        body=body,
+        dry_run=args.dry_run,
+        wait_seconds=args.delay,
+        send=args.send,
+        send_and_archive=args.send_and_archive,
+        confirm=args.confirm,
+        restore_clipboard=not args.no_restore_clipboard,
+    )
+
+
+def cmd_reply_all(args: argparse.Namespace) -> None:
+    body = read_text_argument(args.body, args.body_file)
+    run_reply_flow(
+        "Reply All",
+        body=body,
+        dry_run=args.dry_run,
+        wait_seconds=args.delay,
+        send=args.send,
+        send_and_archive=args.send_and_archive,
+        confirm=args.confirm,
+        restore_clipboard=not args.no_restore_clipboard,
+    )
+
+
+def cmd_insert_text(args: argparse.Namespace) -> None:
+    text = read_text_argument(args.text, args.file)
+    if text is None:
+        raise CliError("Pass text or --file.")
+    if args.dry_run:
+        print(text)
+        print("\nWould paste the text into the frontmost Mimestream control.")
+        return
+    original_clipboard = get_text_clipboard()
+    try:
+        set_text_clipboard(text)
+        paste_into_mimestream(delay_seconds=args.delay)
+    finally:
+        if not args.no_restore_clipboard:
+            set_text_clipboard(original_clipboard)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mimestreamctl",
+        description="Thin CLI for driving the Mimestream macOS app.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    selection_parser = subparsers.add_parser("selection", help="Show the current Mimestream selection.")
+    selection_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    selection_parser.add_argument("--first", action="store_true", help="Print only the first selected item.")
+    selection_parser.set_defaults(func=cmd_selection)
+
+    read_parser = subparsers.add_parser("read", help="Read metadata and body text for the current message.")
+    read_parser.add_argument("--format", choices=["markdown", "plain", "json"], default="markdown", help="Output format. Defaults to markdown.")
+    read_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    read_parser.add_argument("--fast", action="store_true", help="Skip slower row-metadata lookup and return only window/title/link/body.")
+    read_parser.add_argument("--no-body", action="store_true", help="Skip copying the visible message body.")
+    read_parser.add_argument("--max-chars", type=int, help="Truncate the copied body to this many characters.")
+    read_parser.set_defaults(func=cmd_read)
+
+    links_parser = subparsers.add_parser("links", help="Show known URLs for the current message selection.")
+    links_parser.add_argument("--format", choices=["markdown", "plain", "json"], default="markdown", help="Output format. Defaults to markdown.")
+    links_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    links_parser.set_defaults(func=cmd_links)
+
+    activate_parser = subparsers.add_parser("activate", help="Bring Mimestream to the foreground.")
+    activate_parser.set_defaults(func=cmd_activate)
+
+    menus_parser = subparsers.add_parser("menus", help="List top-level menus or menu items.")
+    menus_parser.add_argument("menu", nargs="*", help="Specific top-level menu names to inspect.")
+    menus_parser.add_argument("--all", action="store_true", help="List every top-level menu and its items.")
+    menus_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    menus_parser.set_defaults(func=cmd_menus)
+
+    click_parser = subparsers.add_parser("click", help="Click an arbitrary menu item.")
+    click_parser.add_argument("menu", help="Top-level menu name, for example Message.")
+    click_parser.add_argument("item", help="Exact menu item name.")
+    click_parser.add_argument("--dry-run", action="store_true", help="Print the action without clicking.")
+    click_parser.set_defaults(func=cmd_click)
+
+    go_parser = subparsers.add_parser("go", help="Jump to a built-in mailbox via the Go menu.")
+    go_parser.add_argument("destination", choices=sorted(GO_DESTINATIONS), help="Mailbox destination.")
+    go_parser.add_argument("--dry-run", action="store_true", help="Print the action without clicking.")
+    go_parser.set_defaults(func=cmd_go)
+
+    move_parser = subparsers.add_parser("move", help="Move the current selection to an arbitrary mailbox or label.")
+    move_parser.add_argument("destination", help="Mailbox or label name to type into Move to….")
+    move_parser.add_argument("--delay", type=float, default=0.15, help="Seconds to wait between opening Move to… and confirming the destination.")
+    move_parser.add_argument("--dry-run", action="store_true", help="Print the action without typing into MimeStream.")
+    move_parser.set_defaults(func=cmd_move)
+
+    compose_parser = subparsers.add_parser("compose", help="Open a new draft in Mimestream via mailto:.")
+    compose_parser.add_argument("--to", action="append", help="Primary recipient. Repeat for multiple recipients.")
+    compose_parser.add_argument("--cc", action="append", help="CC recipient. Repeat for multiple recipients.")
+    compose_parser.add_argument("--bcc", action="append", help="BCC recipient. Repeat for multiple recipients.")
+    compose_parser.add_argument("--subject", help="Draft subject.")
+    compose_parser.add_argument("--body", help="Draft body text.")
+    compose_parser.add_argument("--body-file", help="Read the draft body from a file.")
+    compose_parser.add_argument("--print-url", action="store_true", help="Print the generated mailto: URL.")
+    compose_parser.add_argument("--dry-run", action="store_true", help="Print the generated mailto: URL without opening it.")
+    compose_parser.set_defaults(func=cmd_compose)
+
+    reply_parser = subparsers.add_parser("reply", help="Open a reply draft, optionally insert body text, and optionally send it.")
+    reply_parser.add_argument("--body", help="Reply body text.")
+    reply_parser.add_argument("--body-file", help="Read the reply body from a file.")
+    reply_parser.add_argument("--delay", type=float, default=0.2, help="Seconds to wait for the reply draft before pasting.")
+    reply_parser.add_argument("--send", action="store_true", help="Send the reply after pasting.")
+    reply_parser.add_argument("--send-and-archive", action="store_true", help="Send the reply and archive the conversation.")
+    reply_parser.add_argument("--confirm", action="store_true", help="Required when using --send or --send-and-archive.")
+    reply_parser.add_argument("--no-restore-clipboard", action="store_true", help="Leave the reply body text on the clipboard.")
+    reply_parser.add_argument("--dry-run", action="store_true", help="Print the action without touching MimeStream.")
+    reply_parser.set_defaults(func=cmd_reply)
+
+    reply_all_parser = subparsers.add_parser("reply-all", help="Open a reply-all draft, optionally insert body text, and optionally send it.")
+    reply_all_parser.add_argument("--body", help="Reply-all body text.")
+    reply_all_parser.add_argument("--body-file", help="Read the reply-all body from a file.")
+    reply_all_parser.add_argument("--delay", type=float, default=0.2, help="Seconds to wait for the reply-all draft before pasting.")
+    reply_all_parser.add_argument("--send", action="store_true", help="Send the reply-all after pasting.")
+    reply_all_parser.add_argument("--send-and-archive", action="store_true", help="Send the reply-all and archive the conversation.")
+    reply_all_parser.add_argument("--confirm", action="store_true", help="Required when using --send or --send-and-archive.")
+    reply_all_parser.add_argument("--no-restore-clipboard", action="store_true", help="Leave the reply-all body text on the clipboard.")
+    reply_all_parser.add_argument("--dry-run", action="store_true", help="Print the action without touching MimeStream.")
+    reply_all_parser.set_defaults(func=cmd_reply_all)
+
+    insert_parser = subparsers.add_parser("insert-text", help="Paste text into the currently focused Mimestream control.")
+    insert_parser.add_argument("text", nargs="?", help="Inline text to paste.")
+    insert_parser.add_argument("--file", help="Read pasted text from a file.")
+    insert_parser.add_argument("--delay", type=float, default=0.15, help="Seconds to wait after activating Mimestream before pasting.")
+    insert_parser.add_argument("--no-restore-clipboard", action="store_true", help="Leave the pasted text on the clipboard.")
+    insert_parser.add_argument("--dry-run", action="store_true", help="Print the text instead of pasting it.")
+    insert_parser.set_defaults(func=cmd_insert_text)
+
+    for name, action in ACTIONS.items():
+        action_parser = subparsers.add_parser(name, help=action.help)
+        action_parser.add_argument("--confirm", action="store_true", help="Required for destructive commands.")
+        action_parser.add_argument("--dry-run", action="store_true", help="Print the action without clicking.")
+        action_parser.set_defaults(func=cmd_action)
+
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        args.func(args)
+    except CliError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
