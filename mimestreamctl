@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -14,7 +15,6 @@ from urllib.parse import quote, urlencode
 
 
 APP_NAME = "Mimestream"
-APP_BUNDLE_ID = "com.mimestream.Mimestream"
 
 
 class CliError(RuntimeError):
@@ -96,7 +96,10 @@ def normalize_error(raw: str) -> str:
 
 
 def run_osascript(script: str) -> str:
-    proc = run_process(["osascript", "-"], input_text=script)
+    argv = ["osascript"]
+    for line in script.splitlines():
+        argv.extend(["-e", line])
+    proc = run_process(argv)
     stdout = proc.stdout.strip()
     stderr = proc.stderr.strip()
     if proc.returncode != 0:
@@ -108,6 +111,13 @@ def run_open(url: str) -> None:
     proc = run_process(["open", "-a", APP_NAME, url])
     if proc.returncode != 0:
         raise CliError(normalize_error(proc.stderr or proc.stdout))
+
+
+def activate_mimestream(*, delay_seconds: float = 0.0) -> None:
+    script_lines = [f"tell application {applescript_string(APP_NAME)} to activate"]
+    if delay_seconds > 0:
+        script_lines.append(f"delay {delay_seconds}")
+    run_osascript("\n".join(script_lines))
 
 
 def top_menus() -> list[str]:
@@ -149,7 +159,7 @@ return itemNames as text
 
 def current_selection() -> list[str]:
     script = f"""
-tell application id {applescript_string(APP_BUNDLE_ID)}
+tell application {applescript_string(APP_NAME)}
     set sel to selection
 end tell
 if sel is missing value then
@@ -195,7 +205,7 @@ def click_menu_item(menu_name: str, item_name: str, *, dry_run: bool = False) ->
         print(f"Would click {menu_name} > {item_name}")
         return
     script = f"""
-tell application id {applescript_string(APP_BUNDLE_ID)} to activate
+tell application {applescript_string(APP_NAME)} to activate
 tell application "System Events"
     tell process {applescript_string(APP_NAME)}
         if not (exists menu bar item {applescript_string(menu_name)} of menu bar 1) then
@@ -353,7 +363,7 @@ def paste_into_mimestream(*, dry_run: bool = False, delay_seconds: float = 0.15)
         print("Would activate Mimestream and paste clipboard contents")
         return
     script = f"""
-tell application id {applescript_string(APP_BUNDLE_ID)} to activate
+tell application {applescript_string(APP_NAME)} to activate
 delay {delay_seconds}
 tell application "System Events"
     tell process {applescript_string(APP_NAME)}
@@ -396,7 +406,7 @@ def copy_current_message_body() -> str:
 
 def type_text_in_mimestream(text: str, *, delay_seconds: float = 0.15) -> None:
     script = f"""
-tell application id {applescript_string(APP_BUNDLE_ID)} to activate
+tell application {applescript_string(APP_NAME)} to activate
 delay {delay_seconds}
 tell application "System Events"
     tell process {applescript_string(APP_NAME)}
@@ -409,7 +419,7 @@ end tell
 
 def press_key_code(key_code: int, *, delay_seconds: float = 0.1) -> None:
     script = f"""
-tell application id {applescript_string(APP_BUNDLE_ID)} to activate
+tell application {applescript_string(APP_NAME)} to activate
 delay {delay_seconds}
 tell application "System Events"
     tell process {applescript_string(APP_NAME)}
@@ -448,6 +458,200 @@ tell application "System Events"
 end tell
 """
     run_osascript(script)
+
+
+def current_compose_from_options(*, wait_seconds: float = 0.35) -> list[str]:
+    script = f"""
+tell application {applescript_string(APP_NAME)} to activate
+delay {wait_seconds}
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        if not (exists front window) then
+            error "No front window."
+        end if
+        set draftWindow to front window
+        set fromPopup to missing value
+        set totalElements to count of UI elements of draftWindow
+        repeat with i from 1 to totalElements
+            set candidateLabel to UI element i of draftWindow
+            if role of candidateLabel is "AXStaticText" then
+                set candidateName to name of candidateLabel
+                if candidateName is "From:" and i < totalElements then
+                    set candidatePopup to UI element (i + 1) of draftWindow
+                    if role of candidatePopup is "AXPopUpButton" then
+                        set fromPopup to candidatePopup
+                        exit repeat
+                    end if
+                end if
+            end if
+        end repeat
+        if fromPopup is missing value then
+            error "Could not find the From pop-up in the front draft window."
+        end if
+        perform action "AXShowMenu" of fromPopup
+        delay 0.1
+        set optionTitles to {{}}
+        repeat with candidateItem in every menu item of menu 1 of fromPopup
+            set itemTitle to title of candidateItem
+            if itemTitle is not missing value and itemTitle is not "" then
+                copy (itemTitle as text) to end of optionTitles
+            end if
+        end repeat
+        key code 53
+    end tell
+end tell
+set AppleScript's text item delimiters to linefeed
+return optionTitles as text
+"""
+    output = run_osascript(script)
+    return [line for line in output.splitlines() if line]
+
+
+def current_compose_from_value(*, wait_seconds: float = 0.1) -> str:
+    script = f"""
+tell application {applescript_string(APP_NAME)} to activate
+delay {wait_seconds}
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        if not (exists front window) then
+            error "No front window."
+        end if
+        set draftWindow to front window
+        set fromPopup to missing value
+        set totalElements to count of UI elements of draftWindow
+        repeat with i from 1 to totalElements
+            set candidateLabel to UI element i of draftWindow
+            if role of candidateLabel is "AXStaticText" then
+                set candidateName to name of candidateLabel
+                if candidateName is "From:" and i < totalElements then
+                    set candidatePopup to UI element (i + 1) of draftWindow
+                    if role of candidatePopup is "AXPopUpButton" then
+                        set fromPopup to candidatePopup
+                        exit repeat
+                    end if
+                end if
+            end if
+        end repeat
+        if fromPopup is missing value then
+            error "Could not find the From pop-up in the front draft window."
+        end if
+        return value of fromPopup as text
+    end tell
+end tell
+"""
+    return run_osascript(script)
+
+
+def is_transient_compose_error(error: CliError) -> bool:
+    message = str(error)
+    return "No front window." in message or "Could not find the From pop-up" in message
+
+
+def current_compose_from_options_with_retry(*, wait_seconds: float = 0.35, attempts: int = 6) -> list[str]:
+    last_error: CliError | None = None
+    for attempt in range(attempts):
+        try:
+            return current_compose_from_options(wait_seconds=wait_seconds)
+        except CliError as error:
+            if not is_transient_compose_error(error):
+                raise
+            last_error = error
+            if attempt == attempts - 1:
+                raise
+            time.sleep(wait_seconds)
+    raise last_error or CliError("Could not read compose sender options.")
+
+
+def current_compose_from_value_with_retry(*, wait_seconds: float = 0.1, attempts: int = 6) -> str:
+    last_error: CliError | None = None
+    for attempt in range(attempts):
+        try:
+            return current_compose_from_value(wait_seconds=wait_seconds)
+        except CliError as error:
+            if not is_transient_compose_error(error):
+                raise
+            last_error = error
+            if attempt == attempts - 1:
+                raise
+            time.sleep(wait_seconds)
+    raise last_error or CliError("Could not read the compose sender value.")
+
+
+def normalize_sender_match(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def resolve_compose_from_choice(requested: str, options: list[str]) -> str:
+    if not options:
+        raise CliError("No compose sender options were found in the front draft window.")
+    if requested in options:
+        return requested
+
+    normalized_requested = normalize_sender_match(requested)
+    normalized_matches = [option for option in options if normalize_sender_match(option) == normalized_requested]
+    if len(normalized_matches) == 1:
+        return normalized_matches[0]
+
+    contains_matches = [option for option in options if normalized_requested in normalize_sender_match(option)]
+    if len(contains_matches) == 1:
+        return contains_matches[0]
+
+    if normalized_matches or contains_matches:
+        matches = normalized_matches or contains_matches
+        raise CliError(
+            f"Ambiguous --from value {requested!r}. Matching options:\n- " + "\n- ".join(matches)
+        )
+
+    raise CliError(
+        f"Unknown --from value {requested!r}. Available options:\n- " + "\n- ".join(options)
+    )
+
+
+def select_compose_from(sender: str, *, wait_seconds: float = 0.35) -> str:
+    options = current_compose_from_options_with_retry(wait_seconds=wait_seconds)
+    selected_option = resolve_compose_from_choice(sender, options)
+    script = f"""
+tell application {applescript_string(APP_NAME)} to activate
+delay {wait_seconds}
+tell application "System Events"
+    tell process {applescript_string(APP_NAME)}
+        if not (exists front window) then
+            error "No front window."
+        end if
+        set draftWindow to front window
+        set fromPopup to missing value
+        set totalElements to count of UI elements of draftWindow
+        repeat with i from 1 to totalElements
+            set candidateLabel to UI element i of draftWindow
+            if role of candidateLabel is "AXStaticText" then
+                set candidateName to name of candidateLabel
+                if candidateName is "From:" and i < totalElements then
+                    set candidatePopup to UI element (i + 1) of draftWindow
+                    if role of candidatePopup is "AXPopUpButton" then
+                        set fromPopup to candidatePopup
+                        exit repeat
+                    end if
+                end if
+            end if
+        end repeat
+        if fromPopup is missing value then
+            error "Could not find the From pop-up in the front draft window."
+        end if
+        perform action "AXShowMenu" of fromPopup
+        delay 0.1
+        if not (exists menu item {applescript_string(selected_option)} of menu 1 of fromPopup) then
+            error "Compose sender not found: " & {applescript_string(selected_option)}
+        end if
+        click menu item {applescript_string(selected_option)} of menu 1 of fromPopup
+        delay 0.2
+    end tell
+end tell
+"""
+    run_osascript(script)
+    selected_value = current_compose_from_value_with_retry(wait_seconds=0.1)
+    if normalize_sender_match(selected_value) != normalize_sender_match(selected_option):
+        raise CliError(f"Failed to select compose sender {selected_option!r}; got {selected_value!r} instead.")
+    return selected_value
 
 
 def require_confirmation(args: argparse.Namespace, action: MenuAction) -> None:
@@ -600,7 +804,7 @@ def cmd_links(args: argparse.Namespace) -> None:
 
 
 def cmd_activate(_: argparse.Namespace) -> None:
-    run_osascript(f'tell application id {applescript_string(APP_BUNDLE_ID)} to activate')
+    activate_mimestream()
 
 
 def cmd_menus(args: argparse.Namespace) -> None:
@@ -692,9 +896,13 @@ def cmd_compose(args: argparse.Namespace) -> None:
     url = compose_mailto_url(args.to or [], args.cc or [], args.bcc or [], args.subject, body)
     if args.print_url or args.dry_run:
         print(url)
+        if args.from_sender:
+            print(f"Would select From matching: {args.from_sender}")
         if args.dry_run:
             return
     run_open(url)
+    if args.from_sender:
+        select_compose_from(args.from_sender, wait_seconds=args.delay)
 
 
 def cmd_reply(args: argparse.Namespace) -> None:
@@ -793,13 +1001,15 @@ def build_parser() -> argparse.ArgumentParser:
     move_parser.add_argument("--dry-run", action="store_true", help="Print the action without typing into MimeStream.")
     move_parser.set_defaults(func=cmd_move)
 
-    compose_parser = subparsers.add_parser("compose", help="Open a new draft in Mimestream via mailto:.")
+    compose_parser = subparsers.add_parser("compose", help="Open a new draft in Mimestream and optionally select the sender.")
     compose_parser.add_argument("--to", action="append", help="Primary recipient. Repeat for multiple recipients.")
     compose_parser.add_argument("--cc", action="append", help="CC recipient. Repeat for multiple recipients.")
     compose_parser.add_argument("--bcc", action="append", help="BCC recipient. Repeat for multiple recipients.")
+    compose_parser.add_argument("--from", dest="from_sender", help="Sender identity to choose from the compose window. Accepts the full label or a unique substring, such as an email address.")
     compose_parser.add_argument("--subject", help="Draft subject.")
     compose_parser.add_argument("--body", help="Draft body text.")
     compose_parser.add_argument("--body-file", help="Read the draft body from a file.")
+    compose_parser.add_argument("--delay", type=float, default=0.35, help="Seconds to wait for the draft window before selecting --from.")
     compose_parser.add_argument("--print-url", action="store_true", help="Print the generated mailto: URL.")
     compose_parser.add_argument("--dry-run", action="store_true", help="Print the generated mailto: URL without opening it.")
     compose_parser.set_defaults(func=cmd_compose)

@@ -94,9 +94,12 @@ Draft a new message:
 ```bash
 ./mimestreamctl compose \
   --to someone@example.com \
+  --from someone@work.com \
   --subject "Quick follow-up" \
   --body-file /tmp/message.txt
 ```
+
+`--from` selects one sender identity from the compose window. It accepts either the full visible label or a unique substring such as an email address.
 
 ## Commands
 
