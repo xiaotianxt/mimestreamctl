@@ -3,24 +3,97 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import html
 import json
+import plistlib
 import re
+import sqlite3
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 
 APP_NAME = "Mimestream"
+CORE_DATA_EPOCH_OFFSET = 978307200
+DEFAULT_MIMESTREAM_DB = (
+    Path.home()
+    / "Library/Containers/com.mimestream.Mimestream/Data/Library/Application Support/Mimestream/Mimestream.sqlite"
+)
+DEFAULT_MIMESTREAM_PERSISTENCE = (
+    Path.home()
+    / "Library/Containers/com.mimestream.Mimestream/Data/Library/Application Support/Mimestream/Persistence.plist"
+)
+UNSUBSCRIBE_TERMS = (
+    "unsubscribe",
+    "un-subscribe",
+    "opt out",
+    "opt-out",
+    "optout",
+    "email preference",
+    "email preferences",
+    "manage preference",
+    "manage preferences",
+    "subscription preference",
+)
+UNSUBSCRIBE_SUCCESS_TERMS = (
+    "opt out successful",
+    "opt-out successful",
+    "successfully unsubscribed",
+    "unsubscribe successful",
+    "unsubscribe request has been successfully accepted",
+    "request has been successfully accepted",
+    "successfully accepted",
+    "you have been unsubscribed",
+    "you are now unsubscribed",
+    "you will no longer receive",
+    "you'll no longer receive",
+    "will no longer receive",
+    "no longer receive any emails",
+    "preferences have been updated",
+    "subscription preferences updated",
+    "email preferences updated",
+    "has been removed from",
+)
+TRANSACTIONAL_TERMS = (
+    "verification code",
+    "temporary code",
+    "login code",
+    "log-in code",
+    "security alert",
+    "password",
+    "receipt",
+    "invoice",
+    "billing",
+    "payment",
+    "renews",
+    "renewal",
+    "subscription renews",
+    "account alert",
+    "new login",
+    "appointment reminder",
+    "calendar invitation",
+)
 
 
 class CliError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class HttpResult:
+    status: int | None
+    url: str
+    body: str
+    content_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -415,6 +488,34 @@ def read_current_message_ax(*, full: bool = False, include_body: bool = True) ->
     return {key: value for key, value in payload.items() if value is not None}
 
 
+def list_current_messages_ax(*, mode: str, count: int | None = None) -> dict[str, Any]:
+    activate_mimestream(delay_seconds=0.05)
+    binary_path = ensure_ax_reader_binary()
+    argv = [str(binary_path), "--json", "--list"]
+    if mode == "all":
+        argv.append("--all")
+    else:
+        argv.extend(["--latest", str(count if count is not None else 100)])
+    proc = run_process(argv)
+    if proc.returncode != 0:
+        raise CliError(normalize_error(proc.stderr or proc.stdout))
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"Could not decode AX helper output: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CliError("Unexpected AX helper output.")
+    rows: list[dict[str, Any]] = []
+    raw_rows = payload.get("rows")
+    if isinstance(raw_rows, list):
+        for item in raw_rows:
+            if isinstance(item, dict):
+                rows.append({key: value for key, value in item.items() if value is not None})
+    normalized = {key: value for key, value in payload.items() if key != "rows" and value is not None}
+    normalized["rows"] = rows
+    return normalized
+
+
 def read_current_message_ax_with_retry(
     *,
     selection_url: str | None,
@@ -523,6 +624,751 @@ def resolve_body_links(body_links: list[dict[str, str]]) -> list[dict[str, str]]
             updated["resolved_url"] = resolved_url
         resolved_links.append(updated)
     return dedupe_links_by_effective_url(resolved_links)
+
+
+def coredata_seconds(dt: datetime) -> float:
+    return dt.timestamp() - CORE_DATA_EPOCH_OFFSET
+
+
+def datetime_from_coredata(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        seconds = float(value) + CORE_DATA_EPOCH_OFFSET
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(seconds).astimezone().isoformat(timespec="seconds")
+
+
+def parse_time_filter(value: str) -> float:
+    normalized = value.strip()
+    match = re.fullmatch(r"(\d+)([hdw])", normalized, flags=re.IGNORECASE)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        if unit == "h":
+            delta = timedelta(hours=amount)
+        elif unit == "d":
+            delta = timedelta(days=amount)
+        else:
+            delta = timedelta(weeks=amount)
+        return coredata_seconds(datetime.now().astimezone() - delta)
+
+    formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+        local_dt = parsed.astimezone() if parsed.tzinfo else parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return coredata_seconds(local_dt)
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise CliError(f"Could not parse time filter {value!r}. Use 7d, 24h, YYYY-MM-DD, or an ISO datetime.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return coredata_seconds(parsed.astimezone())
+
+
+def mimestream_db_path(path: str | None = None) -> Path:
+    db_path = Path(path).expanduser() if path else DEFAULT_MIMESTREAM_DB
+    if not db_path.exists():
+        raise CliError(f"Mimestream database not found: {db_path}")
+    return db_path
+
+
+def connect_mimestream_db(path: str | None = None) -> sqlite3.Connection:
+    db_path = mimestream_db_path(path)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
+def normalized_account_name(row: sqlite3.Row) -> str | None:
+    name = row["account_name"]
+    if isinstance(name, str) and name.strip():
+        return name
+    if row["account_id"] == 1:
+        return "Gmail"
+    return None
+
+
+def message_row_to_dict(row: sqlite3.Row, *, include_body: bool = False, include_headers: bool = True) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": row["id"],
+        "account": {
+            "id": row["account_id"],
+            "name": normalized_account_name(row),
+            "user_id": row["account_user_id"],
+        },
+        "received_at": datetime_from_coredata(row["date_received"]),
+        "sent_at": datetime_from_coredata(row["date_sent"]),
+        "from": row["from_header"],
+        "subject": row["subject"],
+        "snippet": row["snippet"],
+        "server_id": row["server_id"],
+        "is_trashed": bool(row["is_trashed"]),
+    }
+    if include_headers:
+        payload["headers"] = {
+            "list_id": row["list_id"],
+            "list_unsubscribe": row["list_unsubscribe"],
+            "list_unsubscribe_post": row["list_unsubscribe_post"],
+            "message_id": row["message_id"],
+            "reply_to": row["reply_to"],
+        }
+    if include_body:
+        payload["body_text"] = row["body_text"]
+        payload["body_html"] = row["body_html"]
+    return payload
+
+
+def account_filter_sql(value: str) -> tuple[str, list[Any]]:
+    normalized = value.casefold().strip()
+    if normalized.isdigit():
+        return "m.ZACCOUNT = ?", [int(normalized)]
+    if normalized == "gmail":
+        return "(lower(coalesce(a.ZNAME, '')) = 'gmail' OR (m.ZACCOUNT = 1 AND coalesce(a.ZNAME, '') = ''))", []
+    like = f"%{normalized}%"
+    return "(lower(coalesce(a.ZNAME, '')) LIKE ? OR lower(coalesce(a.ZUSERID, '')) LIKE ?)", [like, like]
+
+
+def message_select_sql(*, include_body: bool = False) -> str:
+    body_columns = ""
+    if include_body:
+        body_columns = ", c.ZBODYTEXT AS body_text, c.ZBODYHTML AS body_html"
+    else:
+        body_columns = ", NULL AS body_text, NULL AS body_html"
+    return f"""
+SELECT
+    m.Z_PK AS id,
+    m.ZACCOUNT AS account_id,
+    a.ZNAME AS account_name,
+    a.ZUSERID AS account_user_id,
+    m.ZDATERECEIVED AS date_received,
+    m.ZDATESENT AS date_sent,
+    m.ZFROMHEADER AS from_header,
+    m.ZSUBJECT AS subject,
+    m.ZSNIPPET AS snippet,
+    m.ZSERVERID AS server_id,
+    m.ZISTRASHED AS is_trashed,
+    c.ZLISTID AS list_id,
+    c.ZLISTUNSUBSCRIBE AS list_unsubscribe,
+    c.ZLISTUNSUBSCRIBEPOST AS list_unsubscribe_post,
+    c.ZMESSAGEID AS message_id,
+    c.ZREPLYTO AS reply_to
+    {body_columns}
+FROM ZMESSAGE m
+LEFT JOIN ZMESSAGECONTENT c ON c.Z_PK = m.ZCONTENT
+LEFT JOIN ZACCOUNT a ON a.Z_PK = m.ZACCOUNT
+"""
+
+
+def fetch_messages(
+    args: argparse.Namespace,
+    *,
+    include_body: bool = False,
+    require_unsubscribe_signal: bool = False,
+    filter_transactional: bool = True,
+) -> list[sqlite3.Row]:
+    where: list[str] = []
+    params: list[Any] = []
+
+    message_id = getattr(args, "id", None)
+    if message_id is not None:
+        where.append("m.Z_PK = ?")
+        params.append(message_id)
+
+    ids_file = getattr(args, "ids_file", None)
+    if ids_file:
+        message_ids = load_message_ids(ids_file)
+        if message_ids:
+            placeholders = ", ".join("?" for _ in message_ids)
+            where.append(f"m.Z_PK IN ({placeholders})")
+            params.extend(message_ids)
+        else:
+            where.append("0 = 1")
+
+    account = getattr(args, "account", None)
+    if account:
+        sql, sql_params = account_filter_sql(account)
+        where.append(sql)
+        params.extend(sql_params)
+
+    from_filter = getattr(args, "from_filter", None)
+    if from_filter:
+        where.append("lower(coalesce(m.ZFROMHEADER, '')) LIKE ?")
+        params.append(f"%{from_filter.casefold()}%")
+
+    subject_filter = getattr(args, "subject", None)
+    if subject_filter:
+        where.append("lower(coalesce(m.ZSUBJECT, '')) LIKE ?")
+        params.append(f"%{subject_filter.casefold()}%")
+
+    query = getattr(args, "query", None)
+    if query:
+        like = f"%{query.casefold()}%"
+        where.append(
+            "("
+            "lower(coalesce(m.ZFROMHEADER, '')) LIKE ? OR "
+            "lower(coalesce(m.ZSUBJECT, '')) LIKE ? OR "
+            "lower(coalesce(m.ZSNIPPET, '')) LIKE ?"
+            ")"
+        )
+        params.extend([like, like, like])
+
+    since = getattr(args, "since", None)
+    if since:
+        where.append("m.ZDATERECEIVED >= ?")
+        params.append(parse_time_filter(since))
+
+    until = getattr(args, "until", None)
+    if until:
+        where.append("m.ZDATERECEIVED <= ?")
+        params.append(parse_time_filter(until))
+
+    if require_unsubscribe_signal:
+        where.append(
+            "("
+            "coalesce(c.ZLISTUNSUBSCRIBE, '') != '' OR "
+            "lower(coalesce(c.ZBODYHTML, '')) LIKE '%unsubscribe%' OR "
+            "lower(coalesce(c.ZBODYTEXT, '')) LIKE '%unsubscribe%'"
+            ")"
+        )
+
+    limit = getattr(args, "limit", None)
+    if limit is None and not ids_file:
+        limit = 50
+    sql = message_select_sql(include_body=include_body)
+    if where:
+        sql += "\nWHERE " + " AND ".join(where)
+    sql += "\nORDER BY m.ZDATERECEIVED DESC"
+    if limit is not None:
+        sql += "\nLIMIT ?"
+        params.append(limit)
+
+    with connect_mimestream_db(getattr(args, "db", None)) as conn:
+        rows = list(conn.execute(sql, params))
+
+    if filter_transactional and not getattr(args, "include_transactional", False):
+        rows = [row for row in rows if not looks_transactional(row)]
+    return rows
+
+
+def looks_transactional(row: sqlite3.Row) -> bool:
+    haystack = " ".join(
+        str(value or "")
+        for value in [
+            row["from_header"],
+            row["subject"],
+            row["snippet"],
+        ]
+    ).casefold()
+    return any(term in haystack for term in TRANSACTIONAL_TERMS)
+
+
+def parse_list_unsubscribe(value: str | None) -> list[str]:
+    if not value:
+        return []
+    bracketed = re.findall(r"<([^>]+)>", value)
+    raw_items = bracketed if bracketed else [part.strip() for part in value.split(",")]
+    urls: list[str] = []
+    for item in raw_items:
+        candidate = item.strip().strip("<>").strip()
+        if not candidate:
+            continue
+        urls.append(candidate)
+    return urls
+
+
+def first_http_url(urls: Iterable[str]) -> str | None:
+    for url in urls:
+        parsed = urlparse(url)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return url
+    return None
+
+
+def contains_unsubscribe_term(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = html.unescape(value).casefold()
+    return any(term in normalized for term in UNSUBSCRIBE_TERMS)
+
+
+def normalize_space(value: str) -> str:
+    return " ".join(value.split())
+
+
+class LinkHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[dict[str, str]] = []
+        self.active_links: list[dict[str, Any]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        href = attr_map.get("href")
+        if href:
+            self.active_links.append({"url": href, "text": []})
+
+    def handle_data(self, data: str) -> None:
+        for link in self.active_links:
+            link["text"].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self.active_links:
+            return
+        link = self.active_links.pop()
+        self.links.append(
+            {
+                "url": str(link["url"]),
+                "text": normalize_space("".join(link["text"])),
+            }
+        )
+
+
+class FormHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: list[dict[str, Any]] = []
+        self.current_form: dict[str, Any] | None = None
+        self.current_button: dict[str, Any] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        if tag == "form":
+            self.current_form = {
+                "method": (attr_map.get("method") or "get").lower(),
+                "action": attr_map.get("action") or "",
+                "controls": [],
+                "buttons": [],
+                "text": [],
+            }
+            return
+        if self.current_form is None:
+            return
+        if tag == "input":
+            control = {
+                "type": (attr_map.get("type") or "text").lower(),
+                "name": attr_map.get("name") or "",
+                "value": attr_map.get("value") or "",
+                "checked": "checked" in attr_map,
+            }
+            self.current_form["controls"].append(control)
+            if control["type"] in {"submit", "button"}:
+                self.current_form["buttons"].append({**control, "text": control["value"]})
+            return
+        if tag == "button":
+            self.current_button = {
+                "type": (attr_map.get("type") or "submit").lower(),
+                "name": attr_map.get("name") or "",
+                "value": attr_map.get("value") or "",
+                "text_parts": [],
+            }
+
+    def handle_data(self, data: str) -> None:
+        if self.current_form is not None:
+            self.current_form["text"].append(data)
+        if self.current_button is not None:
+            self.current_button["text_parts"].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "button" and self.current_form is not None and self.current_button is not None:
+            button = dict(self.current_button)
+            button["text"] = normalize_space("".join(button.pop("text_parts")))
+            self.current_form["buttons"].append(button)
+            self.current_button = None
+            return
+        if tag == "form" and self.current_form is not None:
+            form = dict(self.current_form)
+            form["text"] = normalize_space(" ".join(form["text"]))
+            self.forms.append(form)
+            self.current_form = None
+            self.current_button = None
+
+
+def extract_html_links(body_html: str | None, body_text: str | None = None) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    if body_html:
+        parser = LinkHTMLParser()
+        parser.feed(body_html)
+        links.extend(parser.links)
+    if body_text:
+        for match in re.finditer(r"https?://[^\s<>\"]+", body_text):
+            links.append({"url": match.group(0).rstrip(").,;"), "text": ""})
+    deduped: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    for link in links:
+        url = link.get("url", "").strip()
+        if not url:
+            continue
+        if url not in deduped:
+            deduped[url] = {"url": url, "text": link.get("text", "").strip()}
+            order.append(url)
+        elif len(link.get("text", "")) > len(deduped[url].get("text", "")):
+            deduped[url]["text"] = link.get("text", "").strip()
+    return [deduped[url] for url in order]
+
+
+def extract_unsubscribe_body_links(row: sqlite3.Row) -> list[dict[str, str]]:
+    links = extract_html_links(row["body_html"], row["body_text"])
+    candidates: list[dict[str, str]] = []
+    for link in links:
+        url = link.get("url", "")
+        text = link.get("text", "")
+        if contains_unsubscribe_term(text) or contains_unsubscribe_term(url):
+            parsed = urlparse(url)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                candidates.append(link)
+    return candidates
+
+
+def redact_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if not segments:
+        path_preview = ""
+    elif len(segments) == 1:
+        path_preview = f"/{segments[0]}"
+    else:
+        path_preview = f"/{segments[0]}/..."
+    return f"{parsed.scheme}://{parsed.netloc}{path_preview}"
+
+
+def http_text_request(
+    url: str,
+    *,
+    method: str = "GET",
+    data: dict[str, str] | str | bytes | None = None,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: float = 20.0,
+) -> HttpResult:
+    request_headers = {
+        "User-Agent": "mimestreamctl/1.0",
+    }
+    if headers:
+        request_headers.update(headers)
+    encoded_data: bytes | None
+    if isinstance(data, bytes):
+        encoded_data = data
+    elif isinstance(data, str):
+        encoded_data = data.encode("utf-8")
+    elif isinstance(data, dict):
+        encoded_data = urlencode(data).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    else:
+        encoded_data = None
+    request = Request(url, data=encoded_data, headers=request_headers, method=method)
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read()
+            charset = response.headers.get_content_charset() or "utf-8"
+            body = raw.decode(charset, errors="replace")
+            return HttpResult(
+                status=response.status,
+                url=response.geturl(),
+                body=body,
+                content_type=response.headers.get("Content-Type"),
+            )
+    except HTTPError as exc:
+        raw = exc.read()
+        charset = exc.headers.get_content_charset() or "utf-8"
+        return HttpResult(
+            status=exc.code,
+            url=exc.geturl() or url,
+            body=raw.decode(charset, errors="replace"),
+            content_type=exc.headers.get("Content-Type"),
+        )
+    except URLError as exc:
+        raise CliError(f"HTTP request failed for {redact_url(url)}: {exc}") from exc
+
+
+def html_to_visible_text(value: str) -> str:
+    without_script = re.sub(r"<script\b[^>]*>.*?</script>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    without_style = re.sub(r"<style\b[^>]*>.*?</style>", " ", without_script, flags=re.IGNORECASE | re.DOTALL)
+    without_tags = re.sub(r"<[^>]+>", " ", without_style)
+    return normalize_space(html.unescape(without_tags))
+
+
+def classify_unsubscribe_response(result: HttpResult) -> tuple[str, str | None]:
+    visible_text = html_to_visible_text(result.body).casefold()
+    if any(term in visible_text for term in UNSUBSCRIBE_SUCCESS_TERMS):
+        return "success", None
+    if result.status is not None and 200 <= result.status < 300:
+        if contains_unsubscribe_term(visible_text):
+            return "needs_confirmation", "unsubscribe page loaded but no success confirmation was detected"
+        return "unknown", "request succeeded but response did not contain a recognizable unsubscribe confirmation"
+    return "failed", f"HTTP status {result.status}"
+
+
+def candidate_forms_from_html(body: str) -> list[dict[str, Any]]:
+    parser = FormHTMLParser()
+    parser.feed(body)
+    candidates = []
+    for form in parser.forms:
+        haystack = " ".join(
+            [
+                form.get("action") or "",
+                form.get("text") or "",
+                " ".join(str(button.get("text") or button.get("value") or "") for button in form.get("buttons", [])),
+            ]
+        )
+        if contains_unsubscribe_term(haystack) or "confirm" in haystack.casefold():
+            candidates.append(form)
+    return candidates
+
+
+def candidate_confirmation_links(body: str, *, base_url: str) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    for link in extract_html_links(body):
+        url = urljoin(base_url, link.get("url") or "")
+        text = link.get("text") or ""
+        haystack = f"{text} {url}"
+        if not (contains_unsubscribe_term(haystack) or "confirm" in haystack.casefold()):
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        if url == base_url:
+            continue
+        candidates.append({"url": url, "text": text})
+    return candidates
+
+
+def form_has_unsafe_controls(form: dict[str, Any]) -> bool:
+    for control in form.get("controls", []):
+        control_type = control.get("type")
+        if control_type in {"password", "file"}:
+            return True
+    return False
+
+
+def submit_confirmation_form(
+    form: dict[str, Any],
+    *,
+    base_url: str,
+    timeout_seconds: float,
+) -> HttpResult | None:
+    if form_has_unsafe_controls(form):
+        return None
+    fields: dict[str, str] = {}
+    for control in form.get("controls", []):
+        name = control.get("name") or ""
+        if not name:
+            continue
+        control_type = control.get("type") or "text"
+        if control_type in {"submit", "button", "reset", "image"}:
+            continue
+        if control_type in {"checkbox", "radio"} and not control.get("checked"):
+            continue
+        fields[name] = control.get("value") or ""
+
+    chosen_button: dict[str, Any] | None = None
+    for button in form.get("buttons", []):
+        label = " ".join([str(button.get("text") or ""), str(button.get("value") or "")])
+        if contains_unsubscribe_term(label) or "confirm" in label.casefold() or "submit" in label.casefold():
+            chosen_button = button
+            break
+    if chosen_button and chosen_button.get("name"):
+        fields[str(chosen_button["name"])] = str(chosen_button.get("value") or chosen_button.get("text") or "")
+
+    action_url = urljoin(base_url, form.get("action") or base_url)
+    method = (form.get("method") or "get").upper()
+    if method == "POST":
+        return http_text_request(action_url, method="POST", data=fields, timeout_seconds=timeout_seconds)
+    if method == "GET":
+        separator = "&" if "?" in action_url else "?"
+        target = action_url
+        if fields:
+            target = f"{action_url}{separator}{urlencode(fields)}"
+        return http_text_request(target, timeout_seconds=timeout_seconds)
+    return None
+
+
+def unsubscribe_plan_for_row(row: sqlite3.Row, *, allow_body_links: bool) -> dict[str, Any]:
+    header_urls = parse_list_unsubscribe(row["list_unsubscribe"])
+    header_http_url = first_http_url(header_urls)
+    if header_http_url:
+        post_header = str(row["list_unsubscribe_post"] or "")
+        one_click = "List-Unsubscribe=One-Click" in post_header
+        return {
+            "message": message_row_to_dict(row, include_body=False, include_headers=True),
+            "source": "list_unsubscribe",
+            "method": "one_click_post" if one_click else "link_get",
+            "url": header_http_url,
+            "url_preview": redact_url(header_http_url),
+            "can_execute": True,
+        }
+
+    if any(urlparse(url).scheme == "mailto" for url in header_urls):
+        return {
+            "message": message_row_to_dict(row, include_body=False, include_headers=True),
+            "source": "list_unsubscribe",
+            "method": "mailto",
+            "url": None,
+            "url_preview": None,
+            "can_execute": False,
+            "reason": "List-Unsubscribe only provides mailto; automatic sending is intentionally unsupported",
+        }
+
+    if not allow_body_links:
+        return {
+            "message": message_row_to_dict(row, include_body=False, include_headers=True),
+            "source": None,
+            "method": None,
+            "url": None,
+            "url_preview": None,
+            "can_execute": False,
+            "reason": "no HTTP List-Unsubscribe header and body link fallback disabled",
+        }
+
+    body_links = extract_unsubscribe_body_links(row)
+    if body_links:
+        url = body_links[0]["url"]
+        return {
+            "message": message_row_to_dict(row, include_body=False, include_headers=True),
+            "source": "body_link",
+            "method": "link_get",
+            "url": url,
+            "url_preview": redact_url(url),
+            "link_text": body_links[0].get("text"),
+            "can_execute": True,
+        }
+
+    return {
+        "message": message_row_to_dict(row, include_body=False, include_headers=True),
+        "source": None,
+        "method": None,
+        "url": None,
+        "url_preview": None,
+        "can_execute": False,
+        "reason": "no machine-actionable unsubscribe URL found",
+    }
+
+
+def execute_unsubscribe_plan(
+    plan: dict[str, Any],
+    *,
+    timeout_seconds: float,
+    submit_forms: bool,
+) -> dict[str, Any]:
+    if not plan.get("can_execute") or not plan.get("url"):
+        return {**plan, "status": "skipped"}
+    url = str(plan["url"])
+    method = plan.get("method")
+    try:
+        if method == "one_click_post":
+            result = http_text_request(
+                url,
+                method="POST",
+                data="List-Unsubscribe=One-Click",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            result = http_text_request(url, timeout_seconds=timeout_seconds)
+    except CliError as exc:
+        return {**plan, "status": "failed", "reason": str(exc)}
+
+    status, reason = classify_unsubscribe_response(result)
+    attempts = [
+        {
+            "method": "POST" if method == "one_click_post" else "GET",
+            "url_preview": redact_url(url),
+            "final_url_preview": redact_url(result.url),
+            "http_status": result.status,
+            "classification": status,
+            "reason": reason,
+        }
+    ]
+    if status == "needs_confirmation" and submit_forms:
+        for form in candidate_forms_from_html(result.body):
+            submitted = submit_confirmation_form(form, base_url=result.url, timeout_seconds=timeout_seconds)
+            if submitted is None:
+                continue
+            submitted_status, submitted_reason = classify_unsubscribe_response(submitted)
+            attempts.append(
+                {
+                    "method": (form.get("method") or "get").upper(),
+                    "url_preview": redact_url(urljoin(result.url, form.get("action") or result.url)),
+                    "final_url_preview": redact_url(submitted.url),
+                    "http_status": submitted.status,
+                    "classification": submitted_status,
+                    "reason": submitted_reason,
+                }
+            )
+            status = submitted_status
+            reason = submitted_reason
+            if status == "success":
+                break
+        if status == "needs_confirmation":
+            for link in candidate_confirmation_links(result.body, base_url=result.url):
+                submitted = http_text_request(link["url"], timeout_seconds=timeout_seconds)
+                submitted_status, submitted_reason = classify_unsubscribe_response(submitted)
+                attempts.append(
+                    {
+                        "method": "GET",
+                        "url_preview": redact_url(link["url"]),
+                        "final_url_preview": redact_url(submitted.url),
+                        "http_status": submitted.status,
+                        "classification": submitted_status,
+                        "reason": submitted_reason,
+                    }
+                )
+                status = submitted_status
+                reason = submitted_reason
+                if status == "success":
+                    break
+
+    output = {**plan, "status": status, "attempts": attempts}
+    if reason:
+        output["reason"] = reason
+    if status == "needs_confirmation":
+        output["manual_url_preview"] = redact_url(result.url)
+    return output
+
+
+def sanitize_plan_for_output(plan: dict[str, Any], *, show_urls: bool) -> dict[str, Any]:
+    sanitized = dict(plan)
+    if not show_urls:
+        sanitized.pop("url", None)
+        message = sanitized.get("message")
+        if isinstance(message, dict) and isinstance(message.get("headers"), dict):
+            headers = dict(message["headers"])
+            if headers.get("list_unsubscribe"):
+                headers["list_unsubscribe"] = "(redacted)"
+            message = dict(message)
+            message["headers"] = headers
+            sanitized["message"] = message
+    return sanitized
+
+
+def sanitize_message_for_output(message: dict[str, Any], *, show_urls: bool) -> dict[str, Any]:
+    if show_urls:
+        return message
+    sanitized = dict(message)
+    headers = sanitized.get("headers")
+    if isinstance(headers, dict) and headers.get("list_unsubscribe"):
+        updated_headers = dict(headers)
+        updated_headers["list_unsubscribe"] = "(redacted)"
+        sanitized["headers"] = updated_headers
+    return sanitized
 
 
 def type_text_in_mimestream(text: str, *, delay_seconds: float = 0.15) -> None:
@@ -914,6 +1760,62 @@ def render_links_plain(links: dict[str, Any]) -> None:
                 print(f"- {link.get('text') or link['url']}: {link['url']}")
 
 
+def format_list_row_summary(row: dict[str, Any]) -> str:
+    parts = []
+    if row.get("sender"):
+        parts.append(str(row["sender"]))
+    if row.get("date"):
+        parts.append(str(row["date"]))
+    parts.append(str(row.get("subject") or "(No subject)"))
+    if row.get("preview"):
+        parts.append(str(row["preview"]))
+    return " | ".join(parts)
+
+
+def render_list_markdown(payload: dict[str, Any]) -> None:
+    print("# Current Message List")
+    print()
+    fields = [
+        ("Window", payload.get("window")),
+        ("Scope", payload.get("scope")),
+        ("Limit", payload.get("limit")),
+        ("Rows", payload.get("row_count")),
+        ("Total Rows", payload.get("total_rows")),
+    ]
+    for label, value in fields:
+        if value is not None:
+            print(f"- {label}: {value}")
+    rows = payload.get("rows") or []
+    if rows:
+        print()
+        print("## Rows")
+        print()
+        for row in rows:
+            index = row.get("index", "?")
+            selected_suffix = " [selected]" if row.get("selected") else ""
+            print(f"- Row {index}{selected_suffix}: {format_list_row_summary(row)}")
+
+
+def render_list_plain(payload: dict[str, Any]) -> None:
+    fields = [
+        ("window", payload.get("window")),
+        ("scope", payload.get("scope")),
+        ("limit", payload.get("limit")),
+        ("row_count", payload.get("row_count")),
+        ("total_rows", payload.get("total_rows")),
+    ]
+    for key, value in fields:
+        if value is not None:
+            print(f"{key}: {value}")
+    rows = payload.get("rows") or []
+    if rows:
+        print()
+        for row in rows:
+            index = row.get("index", "?")
+            selected_marker = "*" if row.get("selected") else ""
+            print(f"{index}{selected_marker}: {format_list_row_summary(row)}")
+
+
 def cmd_selection(args: argparse.Namespace) -> None:
     selection = current_selection()
     if args.first:
@@ -923,6 +1825,52 @@ def cmd_selection(args: argparse.Namespace) -> None:
         return
     for item in selection:
         print(item)
+
+
+def parse_positive_int(value: str, *, label: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise CliError(f"{label} must be a positive integer.") from exc
+    if parsed <= 0:
+        raise CliError(f"{label} must be a positive integer.")
+    return parsed
+
+
+def resolve_list_request(tokens: list[str]) -> tuple[str, int | None]:
+    if not tokens:
+        return ("latest", 100)
+    if len(tokens) > 2:
+        raise CliError("Use `list`, `list 100`, `list latest 100`, or `list all`.")
+
+    first = tokens[0]
+    if first == "all":
+        if len(tokens) != 1:
+            raise CliError("`list all` does not take an extra row count.")
+        return ("all", None)
+
+    if first == "latest":
+        if len(tokens) == 1:
+            return ("latest", 100)
+        return ("latest", parse_positive_int(tokens[1], label="latest row count"))
+
+    if len(tokens) == 1:
+        return ("latest", parse_positive_int(first, label="list row count"))
+
+    raise CliError("Use `list`, `list 100`, `list latest 100`, or `list all`.")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    output_format = resolve_output_format(args)
+    mode, count = resolve_list_request(args.selector)
+    payload = list_current_messages_ax(mode=mode, count=count)
+    if output_format == "json":
+        print_json(payload)
+        return
+    if output_format == "plain":
+        render_list_plain(payload)
+        return
+    render_list_markdown(payload)
 
 
 def cmd_read(args: argparse.Namespace) -> None:
@@ -1126,6 +2074,438 @@ def cmd_insert_text(args: argparse.Namespace) -> None:
             set_text_clipboard(original_clipboard)
 
 
+def cmd_mail_accounts(args: argparse.Namespace) -> None:
+    with connect_mimestream_db(args.db) as conn:
+        rows = list(
+            conn.execute(
+                """
+SELECT Z_PK AS id, ZNAME AS name, ZUSERID AS user_id, ZISDISABLED AS is_disabled
+FROM ZACCOUNT
+ORDER BY Z_PK
+"""
+            )
+        )
+    accounts = [
+        {
+            "id": row["id"],
+            "name": row["name"] or ("Gmail" if row["id"] == 1 else None),
+            "user_id": row["user_id"],
+            "is_disabled": bool(row["is_disabled"]),
+        }
+        for row in rows
+    ]
+    print_json({"accounts": accounts})
+
+
+def cmd_mail_search(args: argparse.Namespace) -> None:
+    rows = fetch_messages(args, include_body=False, require_unsubscribe_signal=args.unsubscribe_only)
+    messages = [
+        sanitize_message_for_output(message_row_to_dict(row, include_body=False, include_headers=True), show_urls=args.show_urls)
+        for row in rows
+    ]
+    payload: dict[str, Any] = {"count": len(messages), "summary": summarize_messages(messages)}
+    if not args.summary_only:
+        payload["messages"] = messages
+    print_json(payload)
+
+
+def cmd_mail_get(args: argparse.Namespace) -> None:
+    args.limit = 1
+    rows = fetch_messages(args, include_body=args.include_body or args.include_html or args.links)
+    if not rows:
+        raise CliError(f"Message not found: {args.id}")
+    message = message_row_to_dict(rows[0], include_body=args.include_body or args.include_html, include_headers=True)
+    if not args.include_html:
+        message.pop("body_html", None)
+    if not args.include_body:
+        message.pop("body_text", None)
+    if args.links:
+        links = extract_html_links(rows[0]["body_html"], rows[0]["body_text"])
+        message["links"] = links if args.show_urls else [{**link, "url": redact_url(link["url"])} for link in links]
+    print_json(sanitize_message_for_output(message, show_urls=args.show_urls))
+
+
+def mail_args_have_filter(args: argparse.Namespace) -> bool:
+    return any(
+        [
+            getattr(args, "id", None) is not None,
+            getattr(args, "ids_file", None),
+            getattr(args, "account", None),
+            getattr(args, "from_filter", None),
+            getattr(args, "subject", None),
+            getattr(args, "query", None),
+            getattr(args, "since", None),
+            getattr(args, "until", None),
+        ]
+    )
+
+
+def add_message_id(ids: list[int], value: object) -> None:
+    if isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        ids.append(value)
+        return
+    if isinstance(value, str) and value.isdigit():
+        ids.append(int(value))
+
+
+def collect_message_ids(payload: object) -> list[int]:
+    ids: list[int] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                add_message_id(ids, item.get("id"))
+                message = item.get("message")
+                if isinstance(message, dict):
+                    add_message_id(ids, message.get("id"))
+            else:
+                add_message_id(ids, item)
+        return ids
+
+    if not isinstance(payload, dict):
+        return ids
+
+    raw_ids = payload.get("ids")
+    if isinstance(raw_ids, list):
+        for item in raw_ids:
+            add_message_id(ids, item)
+
+    for key in ("messages", "targets", "results"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                add_message_id(ids, item.get("id"))
+                message = item.get("message")
+                if isinstance(message, dict):
+                    add_message_id(ids, message.get("id"))
+
+    plans = payload.get("plans")
+    if isinstance(plans, list):
+        for plan in plans:
+            if isinstance(plan, dict):
+                message = plan.get("message")
+                if isinstance(message, dict):
+                    add_message_id(ids, message.get("id"))
+    return ids
+
+
+def unique_message_ids(ids: Iterable[int]) -> list[int]:
+    seen: set[int] = set()
+    unique: list[int] = []
+    for message_id in ids:
+        if message_id in seen:
+            continue
+        seen.add(message_id)
+        unique.append(message_id)
+    return unique
+
+
+def load_message_ids(path: str) -> list[int]:
+    id_path = Path(path).expanduser()
+    try:
+        text = id_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CliError(f"Could not read ids file {id_path}: {exc}") from exc
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return unique_message_ids(int(match.group(0)) for match in re.finditer(r"\d+", stripped))
+    return unique_message_ids(collect_message_ids(payload))
+
+
+def write_message_ids(path: str, ids: Iterable[int]) -> dict[str, Any]:
+    id_path = Path(path).expanduser()
+    try:
+        id_path.parent.mkdir(parents=True, exist_ok=True)
+        unique_ids = unique_message_ids(ids)
+        body = "\n".join(str(message_id) for message_id in unique_ids)
+        id_path.write_text(f"{body}\n" if body else "", encoding="utf-8")
+    except OSError as exc:
+        raise CliError(f"Could not write ids file {id_path}: {exc}") from exc
+    return {"path": str(id_path), "count": len(unique_ids)}
+
+
+def counter_items(counter: Counter[str], *, key: str, limit: int | None = None) -> list[dict[str, Any]]:
+    items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    if limit is not None:
+        items = items[:limit]
+    return [{key: label, "count": count} for label, count in items]
+
+
+def message_account_label(message: dict[str, Any]) -> str:
+    account = message.get("account")
+    if isinstance(account, dict):
+        for key in ("email", "name", "user_id", "id"):
+            value = account.get(key)
+            if value is not None and str(value):
+                return str(value)
+    return "unknown"
+
+
+def summarize_messages(messages: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    items = list(messages)
+    return {
+        "count": len(items),
+        "by_account": counter_items(Counter(message_account_label(message) for message in items), key="account"),
+        "by_sender": counter_items(Counter(str(message.get("from") or "unknown") for message in items), key="from"),
+        "top_subjects": counter_items(Counter(str(message.get("subject") or "(No subject)") for message in items), key="subject", limit=12),
+    }
+
+
+def plan_messages(plans: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for plan in plans:
+        message = plan.get("message")
+        if isinstance(message, dict):
+            messages.append(message)
+    return messages
+
+
+def summarize_unsubscribe_plans(plans: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = summarize_messages(plan_messages(plans))
+    summary.update(
+        {
+            "executable_count": sum(1 for plan in plans if plan.get("can_execute")),
+            "blocked_count": sum(1 for plan in plans if not plan.get("can_execute")),
+            "by_method": counter_items(Counter(str(plan.get("method") or "none") for plan in plans), key="method"),
+        }
+    )
+    blocked_reasons = Counter(str(plan.get("reason") or "unknown") for plan in plans if not plan.get("can_execute"))
+    if blocked_reasons:
+        summary["blocked_reasons"] = counter_items(blocked_reasons, key="reason")
+    return summary
+
+
+def summarize_unsubscribe_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = summarize_messages(plan_messages(results))
+    summary["status_counts"] = dict(Counter(str(result.get("status") or "unknown") for result in results))
+    return summary
+
+
+def load_account_emails_by_user_id(path: Path = DEFAULT_MIMESTREAM_PERSISTENCE) -> dict[str, str]:
+    try:
+        with path.open("rb") as handle:
+            payload = plistlib.load(handle)
+    except OSError as exc:
+        raise CliError(f"Could not read Mimestream account metadata: {exc}") from exc
+    except plistlib.InvalidFileException as exc:
+        raise CliError(f"Could not parse Mimestream account metadata: {exc}") from exc
+
+    accounts = payload.get("accounts", [])
+    if not isinstance(accounts, list):
+        return {}
+
+    emails: dict[str, str] = {}
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        user_id = account.get("userID")
+        email = account.get("email")
+        if user_id and email:
+            emails[str(user_id)] = str(email)
+    return emails
+
+
+def trash_target_for_row(row: sqlite3.Row, emails_by_user_id: dict[str, str]) -> dict[str, Any]:
+    message = message_row_to_dict(row, include_body=False, include_headers=False)
+    user_id = str(row["account_user_id"] or "")
+    account = message.get("account")
+    if isinstance(account, dict):
+        account["email"] = emails_by_user_id.get(user_id)
+    return message
+
+
+def execute_gmail_trash(row: sqlite3.Row, emails_by_user_id: dict[str, str]) -> dict[str, Any]:
+    result = trash_target_for_row(row, emails_by_user_id)
+    account = result.get("account") if isinstance(result.get("account"), dict) else {}
+    account_email = account.get("email") if isinstance(account, dict) else None
+    server_id = result.get("server_id")
+
+    if not account_email:
+        return {**result, "status": "failed", "reason": "could not resolve account email from Mimestream account metadata"}
+    if not server_id:
+        return {**result, "status": "failed", "reason": "message has no Gmail server id"}
+
+    params = json.dumps({"userId": account_email, "id": server_id})
+    proc = run_process(["gws", "gmail", "users", "messages", "trash", "--params", params])
+    if proc.returncode != 0:
+        return {**result, "status": "failed", "reason": normalize_error(proc.stderr or proc.stdout)}
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        payload = {}
+    return {**result, "status": "success", "label_ids": payload.get("labelIds")}
+
+
+def cmd_mail_trash(args: argparse.Namespace) -> None:
+    if not args.dry_run and not args.confirm:
+        raise CliError("`mail trash` requires --confirm unless --dry-run is set.")
+    if not mail_args_have_filter(args):
+        raise CliError("Pass --id or at least one filter such as --from, --subject, --query, or --since.")
+
+    matched_rows = fetch_messages(args, include_body=False, require_unsubscribe_signal=args.unsubscribe_only)
+    already_trashed_count = sum(1 for row in matched_rows if row["is_trashed"])
+    rows = matched_rows
+    if not args.include_trashed:
+        rows = [row for row in rows if not row["is_trashed"]]
+    emails_by_user_id = load_account_emails_by_user_id()
+    targets = [trash_target_for_row(row, emails_by_user_id) for row in rows]
+    ids_file = write_message_ids(args.write_ids, (row["id"] for row in rows)) if args.write_ids else None
+
+    if args.dry_run:
+        by_account = Counter(
+            (
+                target.get("account", {}).get("email")
+                if isinstance(target.get("account"), dict)
+                else None
+            )
+            or (
+                target.get("account", {}).get("user_id")
+                if isinstance(target.get("account"), dict)
+                else "unknown"
+            )
+            for target in targets
+        )
+        summary = summarize_messages(targets)
+        summary.update(
+            {
+                "matched_count": len(matched_rows),
+                "target_count": len(targets),
+                "already_trashed_count": already_trashed_count,
+                "skipped_already_trashed_count": 0 if args.include_trashed else already_trashed_count,
+            }
+        )
+        payload: dict[str, Any] = {
+            "mode": "dry_run",
+            "count": len(targets),
+            "matched_count": len(matched_rows),
+            "target_count": len(targets),
+            "already_trashed_count": already_trashed_count,
+            "skipped_already_trashed_count": 0 if args.include_trashed else already_trashed_count,
+            "by_account": dict(by_account),
+            "summary": summary,
+        }
+        if ids_file:
+            payload["ids_file"] = ids_file
+        if not args.summary_only:
+            payload["targets"] = targets
+        print_json(payload)
+        return
+
+    results = [execute_gmail_trash(row, emails_by_user_id) for row in rows]
+    status_counts = Counter(str(result.get("status") or "unknown") for result in results)
+    summary = summarize_messages(results)
+    summary.update(
+        {
+            "matched_count": len(matched_rows),
+            "target_count": len(results),
+            "already_trashed_count": already_trashed_count,
+            "skipped_already_trashed_count": 0 if args.include_trashed else already_trashed_count,
+            "status_counts": dict(status_counts),
+        }
+    )
+    payload = {
+        "mode": "execute",
+        "count": len(results),
+        "matched_count": len(matched_rows),
+        "target_count": len(results),
+        "already_trashed_count": already_trashed_count,
+        "skipped_already_trashed_count": 0 if args.include_trashed else already_trashed_count,
+        "status_counts": dict(status_counts),
+        "summary": summary,
+    }
+    if ids_file:
+        payload["ids_file"] = ids_file
+    if not args.summary_only:
+        payload["results"] = results
+    print_json(payload)
+
+
+def cmd_mail_unsubscribe(args: argparse.Namespace) -> None:
+    if not args.dry_run and not args.confirm:
+        raise CliError("`mail unsubscribe` requires --confirm unless --dry-run is set.")
+    if not mail_args_have_filter(args):
+        raise CliError("Pass --id or at least one filter such as --from, --subject, --query, or --since.")
+
+    rows = fetch_messages(args, include_body=True, require_unsubscribe_signal=True, filter_transactional=False)
+    plans = []
+    for row in rows:
+        if not args.include_transactional and looks_transactional(row):
+            plans.append(
+                {
+                    "message": message_row_to_dict(row, include_body=False, include_headers=True),
+                    "source": None,
+                    "method": None,
+                    "url": None,
+                    "url_preview": None,
+                    "can_execute": False,
+                    "reason": "looks like transactional/security/billing mail; pass --include-transactional to override",
+                }
+            )
+            continue
+        plans.append(unsubscribe_plan_for_row(row, allow_body_links=not args.headers_only))
+    executable = [plan for plan in plans if plan.get("can_execute")]
+    blocked = [plan for plan in plans if not plan.get("can_execute")]
+    ids_file = (
+        write_message_ids(
+            args.write_ids,
+            (message["id"] for message in plan_messages(plans) if isinstance(message.get("id"), int)),
+        )
+        if args.write_ids
+        else None
+    )
+
+    if args.dry_run:
+        payload: dict[str, Any] = {
+            "mode": "dry_run",
+            "count": len(plans),
+            "executable_count": len(executable),
+            "blocked_count": len(blocked),
+            "summary": summarize_unsubscribe_plans(plans),
+        }
+        if ids_file:
+            payload["ids_file"] = ids_file
+        if not args.summary_only:
+            payload["plans"] = [sanitize_plan_for_output(plan, show_urls=args.show_urls) for plan in plans]
+        print_json(payload)
+        return
+
+    results = [
+        execute_unsubscribe_plan(
+            plan,
+            timeout_seconds=args.timeout,
+            submit_forms=not args.no_submit_forms,
+        )
+        for plan in executable
+    ]
+    results.extend({**plan, "status": "skipped"} for plan in blocked)
+
+    counts: dict[str, int] = {}
+    for result in results:
+        status = str(result.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+
+    payload = {
+        "mode": "execute",
+        "count": len(results),
+        "status_counts": counts,
+        "summary": summarize_unsubscribe_results(results),
+    }
+    if ids_file:
+        payload["ids_file"] = ids_file
+    if not args.summary_only:
+        payload["results"] = [sanitize_plan_for_output(result, show_urls=args.show_urls) for result in results]
+    print_json(payload)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mimestreamctl",
@@ -1137,6 +2517,12 @@ def build_parser() -> argparse.ArgumentParser:
     selection_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
     selection_parser.add_argument("--first", action="store_true", help="Print only the first selected item.")
     selection_parser.set_defaults(func=cmd_selection)
+
+    list_parser = subparsers.add_parser("list", help="List rows from the current Mimestream message table.")
+    list_parser.add_argument("selector", nargs="*", help="Use `all`, `latest <count>`, or just `<count>`. Defaults to latest 100.")
+    list_parser.add_argument("--format", choices=["markdown", "plain", "json"], default="markdown", help="Output format. Defaults to markdown.")
+    list_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    list_parser.set_defaults(func=cmd_list)
 
     read_parser = subparsers.add_parser("read", help="Read metadata and body text for the current message.")
     read_parser.add_argument("--format", choices=["markdown", "plain", "json"], default="markdown", help="Output format. Defaults to markdown.")
@@ -1223,6 +2609,68 @@ def build_parser() -> argparse.ArgumentParser:
     insert_parser.add_argument("--no-restore-clipboard", action="store_true", help="Leave the pasted text on the clipboard.")
     insert_parser.add_argument("--dry-run", action="store_true", help="Print the text instead of pasting it.")
     insert_parser.set_defaults(func=cmd_insert_text)
+
+    mail_parser = subparsers.add_parser("mail", help="Query Mimestream's local mail cache and run higher-level mail tasks.")
+    mail_subparsers = mail_parser.add_subparsers(dest="mail_command", required=True)
+
+    def add_mail_db_arg(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--db", help="Path to Mimestream.sqlite. Defaults to the local Mimestream container database.")
+
+    def add_mail_filters(target: argparse.ArgumentParser, *, include_id: bool = False) -> None:
+        add_mail_db_arg(target)
+        if include_id:
+            target.add_argument("--id", type=int, help="Local Mimestream message id (ZMESSAGE.Z_PK).")
+            target.add_argument("--ids-file", help="Read exact local Mimestream message ids from a newline/comma/JSON file.")
+        target.add_argument("--account", help="Account id/name/user id filter. `gmail` matches the default Gmail account.")
+        target.add_argument("--from", dest="from_filter", help="Substring filter for the From header.")
+        target.add_argument("--subject", help="Substring filter for the subject.")
+        target.add_argument("--query", help="Substring filter across From, subject, and snippet.")
+        target.add_argument("--since", help="Only messages received after this time. Supports 24h, 7d, YYYY-MM-DD, or ISO datetime.")
+        target.add_argument("--until", help="Only messages received before this time. Supports 24h, 7d, YYYY-MM-DD, or ISO datetime.")
+        target.add_argument("--limit", type=int, help="Maximum messages to inspect. Defaults to 50 unless --ids-file is used.")
+        target.add_argument("--include-transactional", action="store_true", help="Do not filter likely transactional/security/billing messages.")
+
+    accounts_parser = mail_subparsers.add_parser("accounts", help="List accounts known to the local Mimestream cache.")
+    add_mail_db_arg(accounts_parser)
+    accounts_parser.set_defaults(func=cmd_mail_accounts)
+
+    mail_search_parser = mail_subparsers.add_parser("search", help="Search messages in the local Mimestream cache.")
+    add_mail_filters(mail_search_parser)
+    mail_search_parser.add_argument("--unsubscribe-only", action="store_true", help="Only include messages with an unsubscribe signal.")
+    mail_search_parser.add_argument("--show-urls", action="store_true", help="Show full List-Unsubscribe headers instead of redacting tokenized URLs.")
+    mail_search_parser.add_argument("--summary-only", action="store_true", help="Only print aggregate counts; omit per-message records.")
+    mail_search_parser.set_defaults(func=cmd_mail_search)
+
+    mail_get_parser = mail_subparsers.add_parser("get", help="Read one message from the local Mimestream cache.")
+    add_mail_db_arg(mail_get_parser)
+    mail_get_parser.add_argument("--id", type=int, required=True, help="Local Mimestream message id (ZMESSAGE.Z_PK).")
+    mail_get_parser.add_argument("--include-body", action="store_true", help="Include the plain-text body.")
+    mail_get_parser.add_argument("--include-html", action="store_true", help="Include the HTML body.")
+    mail_get_parser.add_argument("--links", action="store_true", help="Extract links from the message body.")
+    mail_get_parser.add_argument("--show-urls", action="store_true", help="Show full extracted URLs instead of redacted URL previews.")
+    mail_get_parser.set_defaults(func=cmd_mail_get)
+
+    mail_trash_parser = mail_subparsers.add_parser("trash", help="Move matching Gmail messages to Trash using Mimestream's local cache for targeting.")
+    add_mail_filters(mail_trash_parser, include_id=True)
+    mail_trash_parser.add_argument("--unsubscribe-only", action="store_true", help="Only include messages with an unsubscribe signal.")
+    mail_trash_parser.add_argument("--include-trashed", action="store_true", help="Include messages already marked as trashed in the local Mimestream cache.")
+    mail_trash_parser.add_argument("--dry-run", action="store_true", help="Show matching messages without trashing them.")
+    mail_trash_parser.add_argument("--confirm", action="store_true", help="Required to move messages to Trash.")
+    mail_trash_parser.add_argument("--summary-only", action="store_true", help="Only print aggregate counts; omit per-message targets/results.")
+    mail_trash_parser.add_argument("--write-ids", help="Write the exact targeted local message ids to this file.")
+    mail_trash_parser.set_defaults(func=cmd_mail_trash)
+
+    mail_unsubscribe_parser = mail_subparsers.add_parser("unsubscribe", help="Plan or execute unsubscribe actions for matching messages.")
+    add_mail_filters(mail_unsubscribe_parser, include_id=True)
+    mail_unsubscribe_parser.add_argument("--dry-run", action="store_true", help="Show the unsubscribe plan without making HTTP requests.")
+    mail_unsubscribe_parser.add_argument("--confirm", action="store_true", help="Required to execute unsubscribe requests.")
+    mail_unsubscribe_parser.add_argument("--headers-only", action="store_true", help="Use only List-Unsubscribe headers; do not fall back to body links.")
+    mail_unsubscribe_parser.add_argument("--no-submit-forms", action="store_true", help="Do not auto-submit simple unsubscribe confirmation forms.")
+    mail_unsubscribe_parser.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout per unsubscribe request in seconds.")
+    mail_unsubscribe_parser.add_argument("--show-urls", action="store_true", help="Show full unsubscribe URLs instead of redacted URL previews.")
+    mail_unsubscribe_parser.add_argument("--summary-only", action="store_true", help="Only print aggregate counts; omit per-message plans/results.")
+    mail_unsubscribe_parser.add_argument("--write-ids", help="Write the matched local message ids to this file for an exact follow-up action.")
+    mail_unsubscribe_parser.set_defaults(func=cmd_mail_unsubscribe)
 
     for name, action in ACTIONS.items():
         action_parser = subparsers.add_parser(name, help=action.help)

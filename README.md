@@ -21,6 +21,9 @@ The result is a lightweight interface that works well under Codex, shell scripts
 ## What It Can Do
 
 - Read the selected message as `markdown`, `plain`, or `json`
+- List the latest `N` rows or all rows from the current message table
+- Search the local Mimestream cache without depending on the front UI window
+- Plan and execute safe unsubscribe actions from `List-Unsubscribe` headers or clear body links
 - Extract stable links for the current message
 - Reply or reply-all with generated text
 - Move the current thread to a mailbox or label
@@ -76,6 +79,34 @@ Read the currently selected message:
 ./mimestreamctl links --resolve-redirects --json
 ```
 
+List the current mailbox rows:
+
+```bash
+./mimestreamctl list
+./mimestreamctl list 100 --json
+./mimestreamctl list latest 250
+./mimestreamctl list all --format plain
+```
+
+`list` defaults to the latest `100` rows. `list all` walks every row currently exposed through Accessibility, so it can take noticeably longer on large mailboxes.
+
+Search the local mail cache:
+
+```bash
+./mimestreamctl mail accounts
+./mimestreamctl mail search --account gmail --from openai --since 7d --limit 10
+./mimestreamctl mail get --id 19244 --links
+```
+
+Plan and execute unsubscribe actions:
+
+```bash
+./mimestreamctl mail unsubscribe --account gmail --from openai --since 7d --dry-run
+./mimestreamctl mail unsubscribe --account gmail --from openai --since 7d --confirm
+```
+
+`mail unsubscribe` prefers machine-readable `List-Unsubscribe` headers. If a message has no usable header, it can fall back to unsubscribe links in the HTML/text body and follow simple unsubscribe confirmation forms or links. It does not handle JavaScript-only pages, CAPTCHAs, or sign-in-required flows; those return a non-success status for manual handling. Tokenized unsubscribe URLs are redacted by default; pass `--show-urls` only when you intentionally need full URLs.
+
 Reply to the selected message:
 
 ```bash
@@ -106,6 +137,11 @@ Draft a new message:
 ## Commands
 
 - `selection`
+- `list [latest [count]|count|all]`
+- `mail accounts`
+- `mail search`
+- `mail get --id <id>`
+- `mail unsubscribe --dry-run|--confirm`
 - `read`
 - `links`
 - `activate`
@@ -154,11 +190,13 @@ Known link fields:
 - `read --full` still uses the Swift Accessibility helper, but also asks it for extra row metadata
 - body extraction reads the message `AXWebArea` directly, so it does not depend on keyboard focus being in the message body
 - destructive or sending actions require explicit `--confirm`
+- `mail unsubscribe` also requires `--confirm` unless `--dry-run` is used
 - `insert-text` restores the previous clipboard contents by default
 
 ## Caveats
 
 - This is local macOS automation, not an official Mimestream API
 - UI structure changes in future Mimestream releases may require locator updates
+- `mail` commands read Mimestream's local SQLite cache, so results reflect what Mimestream has already synced
 - `move` depends on the current `Move to...` destination matching behavior in Mimestream
 - automation must run inside the logged-in desktop session

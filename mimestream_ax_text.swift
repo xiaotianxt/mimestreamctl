@@ -4,10 +4,23 @@ import Foundation
 
 private let bundleID = "com.mimestream.Mimestream"
 
+enum CommandMode {
+    case read
+    case list
+}
+
+enum ListScope: String {
+    case latest
+    case all
+}
+
 struct Options {
     var emitJSON = false
     var includeFullMetadata = false
     var includeBody = true
+    var command = CommandMode.read
+    var listScope = ListScope.latest
+    var listLimit = 100
 }
 
 struct BodyLink: Codable {
@@ -35,6 +48,33 @@ struct ReadPayload: Codable {
     }
 }
 
+struct MessageListRow: Codable {
+    var index: Int
+    var selected: Bool
+    var sender: String?
+    var date: String?
+    var subject: String?
+    var preview: String?
+}
+
+struct MessageListPayload: Codable {
+    var window: String?
+    var scope: String
+    var limit: Int?
+    var rowCount: Int
+    var totalRows: Int
+    var rows: [MessageListRow]
+
+    enum CodingKeys: String, CodingKey {
+        case window
+        case scope
+        case limit
+        case rowCount = "row_count"
+        case totalRows = "total_rows"
+        case rows
+    }
+}
+
 private func fail(_ message: String, code: Int32 = 1) -> Never {
     fputs(message + "\n", stderr)
     exit(code)
@@ -42,17 +82,37 @@ private func fail(_ message: String, code: Int32 = 1) -> Never {
 
 private func parseOptions() -> Options {
     var options = Options()
-    for argument in CommandLine.arguments.dropFirst() {
+    let arguments = Array(CommandLine.arguments.dropFirst())
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
         switch argument {
         case "--json":
             options.emitJSON = true
+        case "--list":
+            options.command = .list
         case "--full":
             options.includeFullMetadata = true
         case "--no-body":
             options.includeBody = false
+        case "--latest":
+            options.command = .list
+            options.listScope = .latest
+            guard index + 1 < arguments.count else {
+                fail("Missing row count after --latest.")
+            }
+            guard let limit = Int(arguments[index + 1]), limit > 0 else {
+                fail("`--latest` expects a positive integer row count.")
+            }
+            options.listLimit = limit
+            index += 1
+        case "--all":
+            options.command = .list
+            options.listScope = .all
         default:
             fail("Unknown argument: \(argument)")
         }
+        index += 1
     }
     return options
 }
@@ -106,6 +166,25 @@ private func boolAttribute(_ element: AXUIElement, _ name: String) -> Bool? {
 
 private func stringAttribute(_ element: AXUIElement, _ name: String) -> String? {
     copyAttribute(element, name) as? String
+}
+
+private func frame(of element: AXUIElement) -> CGRect? {
+    guard let value = copyAttribute(element, "AXFrame") else {
+        return nil
+    }
+    let cfValue = value
+    guard CFGetTypeID(cfValue) == AXValueGetTypeID() else {
+        return nil
+    }
+    let axValue = unsafeBitCast(cfValue, to: AXValue.self)
+    guard AXValueGetType(axValue) == .cgRect else {
+        return nil
+    }
+    var frame = CGRect.zero
+    guard AXValueGetValue(axValue, .cgRect, &frame) else {
+        return nil
+    }
+    return frame
 }
 
 private func urlStringAttribute(_ element: AXUIElement, _ name: String) -> String? {
@@ -423,8 +502,16 @@ private func findMessageTable(in focusedWindow: AXUIElement) -> AXUIElement? {
     return findFirst(splitGroup, role: "AXTable", maxDepth: 8)
 }
 
-private func selectedRow(in table: AXUIElement) -> AXUIElement? {
+private func allRows(in table: AXUIElement) -> [AXUIElement] {
     let rows = copyElementArrayAttribute(table, kAXRowsAttribute as String)
+    if !rows.isEmpty {
+        return rows
+    }
+    return children(of: table).filter { role(of: $0) == "AXRow" }
+}
+
+private func selectedRow(in table: AXUIElement) -> AXUIElement? {
+    let rows = allRows(in: table)
     if let selected = rows.first(where: { boolAttribute($0, kAXSelectedAttribute as String) == true }) {
         return selected
     }
@@ -434,14 +521,7 @@ private func selectedRow(in table: AXUIElement) -> AXUIElement? {
     }
 }
 
-private func selectedRowMetadata(in focusedWindow: AXUIElement) -> (sender: String?, date: String?, subject: String?, preview: String?) {
-    guard
-        let table = findMessageTable(in: focusedWindow),
-        let row = selectedRow(in: table)
-    else {
-        return (nil, nil, nil, nil)
-    }
-
+private func rowMetadata(from row: AXUIElement) -> (sender: String?, date: String?, subject: String?, preview: String?) {
     let cell = firstChild(of: row, role: "AXCell") ?? children(of: row).first ?? row
     let parts = dedupeConsecutive(collectRowParts(from: cell))
 
@@ -460,6 +540,72 @@ private func selectedRowMetadata(in focusedWindow: AXUIElement) -> (sender: Stri
     )
 }
 
+private func selectedRowMetadata(in focusedWindow: AXUIElement) -> (sender: String?, date: String?, subject: String?, preview: String?) {
+    guard
+        let table = findMessageTable(in: focusedWindow),
+        let row = selectedRow(in: table)
+    else {
+        return (nil, nil, nil, nil)
+    }
+
+    return rowMetadata(from: row)
+}
+
+private func messageListPayload(in focusedWindow: AXUIElement, scope: ListScope, limit: Int, windowTitle: String?) -> MessageListPayload {
+    guard let table = findMessageTable(in: focusedWindow) else {
+        fail("Could not find the message list.")
+    }
+
+    let allMessageRows = allRows(in: table)
+    guard !allMessageRows.isEmpty else {
+        fail("Could not find any message rows.")
+    }
+
+    let scopedRows: [AXUIElement]
+    let effectiveLimit: Int?
+    switch scope {
+    case .latest:
+        effectiveLimit = limit
+        scopedRows = Array(allMessageRows.prefix(limit))
+    case .all:
+        effectiveLimit = nil
+        scopedRows = allMessageRows
+    }
+
+    let rows = scopedRows.enumerated().map { offset, row in
+        let resolvedIndex =
+            allMessageRows.firstIndex(where: { CFEqual($0, row) }).map { $0 + 1 }
+            ?? (offset + 1)
+        let metadata = rowMetadata(from: row)
+        return MessageListRow(
+            index: resolvedIndex,
+            selected: boolAttribute(row, kAXSelectedAttribute as String) == true,
+            sender: metadata.sender,
+            date: metadata.date,
+            subject: metadata.subject,
+            preview: metadata.preview
+        )
+    }
+
+    return MessageListPayload(
+        window: windowTitle,
+        scope: scope.rawValue,
+        limit: effectiveLimit,
+        rowCount: rows.count,
+        totalRows: allMessageRows.count,
+        rows: rows
+    )
+}
+
+private func emitJSON<T: Encodable>(_ payload: T) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    guard let data = try? encoder.encode(payload), let json = String(data: data, encoding: .utf8) else {
+        fail("Could not encode the AX payload.")
+    }
+    print(json)
+}
+
 let options = parseOptions()
 
 guard let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
@@ -472,37 +618,46 @@ guard let focusedWindow = findFocusedWindow(for: axApp) else {
 }
 
 let windowTitle = readableString(of: focusedWindow)
-let body: String? = options.includeBody ? extractBody(from: focusedWindow) : nil
-if options.includeBody && body == nil {
-    fail("Could not extract text from the current message body.")
-}
 
-let metadata: (sender: String?, date: String?, subject: String?, preview: String?) =
-    options.includeFullMetadata ? selectedRowMetadata(in: focusedWindow) : (nil, nil, nil, nil)
-let bodyLinks = extractBodyLinks(from: focusedWindow)
-let payload = ReadPayload(
-    window: windowTitle,
-    body: body,
-    sender: metadata.sender,
-    date: metadata.date,
-    subject: metadata.subject,
-    preview: metadata.preview,
-    bodyLinks: bodyLinks.isEmpty ? nil : bodyLinks
-)
-
-if options.emitJSON {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    guard let data = try? encoder.encode(payload), let json = String(data: data, encoding: .utf8) else {
-        fail("Could not encode the AX payload.")
+switch options.command {
+case .read:
+    let body: String? = options.includeBody ? extractBody(from: focusedWindow) : nil
+    if options.includeBody && body == nil {
+        fail("Could not extract text from the current message body.")
     }
-    print(json)
+
+    let metadata: (sender: String?, date: String?, subject: String?, preview: String?) =
+        options.includeFullMetadata ? selectedRowMetadata(in: focusedWindow) : (nil, nil, nil, nil)
+    let bodyLinks = extractBodyLinks(from: focusedWindow)
+    let payload = ReadPayload(
+        window: windowTitle,
+        body: body,
+        sender: metadata.sender,
+        date: metadata.date,
+        subject: metadata.subject,
+        preview: metadata.preview,
+        bodyLinks: bodyLinks.isEmpty ? nil : bodyLinks
+    )
+
+    if options.emitJSON {
+        emitJSON(payload)
+        exit(0)
+    }
+
+    if let body {
+        print(body)
+        exit(0)
+    }
+
+    fail("No output was produced.")
+case .list:
+    let payload = messageListPayload(in: focusedWindow, scope: options.listScope, limit: options.listLimit, windowTitle: windowTitle)
+    if options.emitJSON {
+        emitJSON(payload)
+        exit(0)
+    }
+    for row in payload.rows {
+        print(row.subject ?? "(No subject)")
+    }
     exit(0)
 }
-
-if let body {
-    print(body)
-    exit(0)
-}
-
-fail("No output was produced.")
