@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  if [[ "$TARGET" != /* ]]; then
+    SOURCE="$DIR/$TARGET"
+  else
+    SOURCE="$TARGET"
+  fi
+done
+
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+REPO_BIN="$(cd "$SCRIPT_DIR/../../.." && pwd)/mimestreamctl"
+HOME_BIN="$HOME/dev/mimestreamctl/mimestreamctl"
+
+if [[ -n "${MIMESTREAMCTL_BIN:-}" && -x "${MIMESTREAMCTL_BIN}" ]]; then
+  exec "${MIMESTREAMCTL_BIN}" "$@"
+fi
+
+if [[ -x "$REPO_BIN" ]]; then
+  exec "$REPO_BIN" "$@"
+fi
+
+if [[ -x "$HOME_BIN" ]]; then
+  exec "$HOME_BIN" "$@"
+fi
+
+echo "Error: could not find a runnable mimestreamctl binary." >&2
+echo "Checked MIMESTREAMCTL_BIN, repo-local mimestreamctl, and ~/dev/mimestreamctl/mimestreamctl." >&2
+exit 1
